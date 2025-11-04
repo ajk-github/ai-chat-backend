@@ -1,0 +1,80 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+
+.claude.md
+claude/
+.claude
+CLAUDE.md
+
+# Environment Variables
+.env
+.env.local
+.env.*.local
+
+# Firebase
+firebase_config.json
+config/firebase_config.json
+config/*.json
+*.json
+!package.json
+
+
+
+# Logs
+logs/*.log
+logs/*.jsonl
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# DuckDB
+*.duckdb
+*.duckdb.wal
+
+# Data Storage (user data, processed files)
+data/
+
+# Cache
+.cache/
+*.cache
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
