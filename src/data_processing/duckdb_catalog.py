@@ -2,7 +2,7 @@
 DuckDB Catalog Manager
 Handles DuckDB database initialization, Parquet file registration, and query execution.
 """
-
+#src/data_processing/duckdb_catalog.py
 import logging
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -22,8 +22,8 @@ class DuckDBCatalog:
         self,
         database_path: str = "data/catalog.duckdb",
         parquet_dir: str = "data/processed",
-        memory_limit: str = "2GB",
-        threads: int = 4,
+        memory_limit: str = "1GB",
+        threads: int = 2,
         auto_register: bool = False,
     ):
         """
@@ -32,7 +32,7 @@ class DuckDBCatalog:
         Args:
             database_path: Path to DuckDB database file (use :memory: for in-memory)
             parquet_dir: Directory containing Parquet files
-            memory_limit: Memory limit for DuckDB
+            memory_limit: Memory limit for DuckDB (default: 1GB, reduced for better concurrency)
             threads: Number of threads for query execution
         """
         self.database_path = database_path
@@ -228,12 +228,32 @@ class DuckDBCatalog:
                 f"SELECT * FROM {table_name} LIMIT 5"
             ).fetchdf()
 
+            # Convert sample data and serialize Timestamps for JSON compatibility
+            sample_data = sample_df.to_dict(orient='records')
+            for row in sample_data:
+                for key, value in row.items():
+                    if isinstance(value, pd.Timestamp):
+                        row[key] = value.isoformat()
+                    elif value is None:
+                        row[key] = None
+                    elif hasattr(value, '__len__') and not isinstance(value, (str, bytes)):
+                        # Skip array-like objects (lists, arrays, Series) - keep as-is
+                        pass
+                    else:
+                        # Safely check for NaN/NaT (only for scalars)
+                        try:
+                            if pd.isna(value):
+                                row[key] = None
+                        except (ValueError, TypeError):
+                            # If pd.isna() fails (e.g., on arrays), keep the value as-is
+                            pass
+
             return {
                 "table_name": table_name,
                 "row_count": row_count,
                 "column_count": len(schema),
                 "columns": schema,
-                "sample_data": sample_df.to_dict(orient='records'),
+                "sample_data": sample_data,
                 "parquet_path": self.tables.get(table_name, {}).get("parquet_path")
             }
 
@@ -277,9 +297,31 @@ class DuckDBCatalog:
 
             execution_time = (datetime.now() - start_time).total_seconds()
 
+            # Convert DataFrame to dict and serialize Timestamps for JSON compatibility
+            rows = result_df.to_dict(orient='records')
+            
+            # Convert Timestamp objects to ISO format strings
+            for row in rows:
+                for key, value in row.items():
+                    if isinstance(value, pd.Timestamp):
+                        row[key] = value.isoformat()
+                    elif value is None:
+                        row[key] = None
+                    elif hasattr(value, '__len__') and not isinstance(value, (str, bytes)):
+                        # Skip array-like objects (lists, arrays, Series) - keep as-is
+                        pass
+                    else:
+                        # Safely check for NaN/NaT (only for scalars)
+                        try:
+                            if pd.isna(value):
+                                row[key] = None
+                        except (ValueError, TypeError):
+                            # If pd.isna() fails (e.g., on arrays), keep the value as-is
+                            pass
+
             return {
                 "success": True,
-                "rows": result_df.to_dict(orient='records'),
+                "rows": rows,
                 "row_count": len(result_df),
                 "column_names": result_df.columns.tolist(),
                 "execution_time_seconds": execution_time,

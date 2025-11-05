@@ -2,7 +2,7 @@
 Chat Data Manager
 Manages per-chat data storage, file processing, and DuckDB catalog isolation.
 """
-
+#src/data_processing/chat_data_manager.py
 import logging
 import shutil
 import json
@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional, Any
 from datetime import datetime
+from collections import OrderedDict
 
 from data_processing.duckdb_catalog import DuckDBCatalog
 from data_processing.excel_converter import ExcelConverter
@@ -24,12 +25,16 @@ logger = logging.getLogger(__name__)
 class ChatDataManager:
     """Manages data storage and processing for individual chat sessions."""
 
-    def __init__(self, base_data_dir: str = "data/chats"):
+    # Maximum number of catalogs to cache (prevents memory leaks)
+    MAX_CACHE_SIZE = 50
+
+    def __init__(self, base_data_dir: str = "data/chats", max_cache_size: int = None):
         """
         Initialize Chat Data Manager.
 
         Args:
             base_data_dir: Base directory for all chat data
+            max_cache_size: Maximum number of catalogs to cache (default: 50)
         """
         self.base_data_dir = Path(base_data_dir)
         self.base_data_dir.mkdir(parents=True, exist_ok=True)
@@ -39,8 +44,10 @@ class ChatDataManager:
         self.csv_converter = CSVConverter()
         self.schema_profiler = SchemaProfiler()
 
-        # Cache for active catalogs
-        self._catalog_cache: Dict[str, DuckDBCatalog] = {}
+        # LRU cache for active catalogs (OrderedDict for LRU eviction)
+        # OrderedDict maintains insertion order, oldest entries are evicted first
+        self.max_cache_size = max_cache_size or self.MAX_CACHE_SIZE
+        self._catalog_cache: OrderedDict[str, DuckDBCatalog] = OrderedDict()
 
     def create_chat_workspace(self, chat_id: str) -> Dict[str, str]:
         """
@@ -170,6 +177,15 @@ class ChatDataManager:
                 )
             except Exception as e:
                 logger.error(f"Error registering table {table['table_name']}: {e}")
+
+        # Delete raw file after successful conversion (we only need Parquet files)
+        try:
+            if raw_path.exists():
+                raw_path.unlink()
+                logger.info(f"Deleted raw file after successful conversion: {raw_path.name}")
+        except Exception as e:
+            logger.warning(f"Failed to delete raw file {raw_path.name}: {e}")
+            # Don't fail the whole operation if cleanup fails
 
         # Update metadata
         self._update_metadata(chat_id, {
@@ -306,6 +322,9 @@ class ChatDataManager:
     def get_chat_catalog(self, chat_id: str) -> DuckDBCatalog:
         """
         Get or create DuckDB catalog for chat.
+        
+        Uses LRU cache with automatic eviction to prevent memory leaks.
+        When cache is full, oldest entries are evicted and their connections closed.
 
         Args:
             chat_id: Chat session ID
@@ -313,9 +332,13 @@ class ChatDataManager:
         Returns:
             DuckDBCatalog instance for this chat
         """
-        # Check cache first
+        # Check cache first - move to end (most recently used)
         if chat_id in self._catalog_cache:
-            return self._catalog_cache[chat_id]
+            # Move to end (mark as recently used)
+            catalog = self._catalog_cache.pop(chat_id)
+            self._catalog_cache[chat_id] = catalog
+            logger.debug(f"Cache hit for chat: {chat_id}")
+            return catalog
 
         # Ensure workspace exists
         chat_dir = self.base_data_dir / chat_id
@@ -331,12 +354,54 @@ class ChatDataManager:
             parquet_dir=str(processed_dir)
         )
 
-        # Cache it
+        # Evict oldest entries if cache is full
+        if len(self._catalog_cache) >= self.max_cache_size:
+            self._evict_oldest_catalog()
+
+        # Add to cache (at end, most recently used)
         self._catalog_cache[chat_id] = catalog
 
-        logger.info(f"Initialized catalog for chat: {chat_id}")
+        logger.info(f"Initialized catalog for chat: {chat_id} (cache size: {len(self._catalog_cache)}/{self.max_cache_size})")
 
         return catalog
+
+    def _evict_oldest_catalog(self):
+        """
+        Evict the oldest catalog from cache and close its connection.
+        
+        This prevents memory leaks by ensuring connections are properly closed
+        when catalogs are removed from cache.
+        """
+        if not self._catalog_cache:
+            return
+
+        # Get oldest entry (first in OrderedDict)
+        chat_id, catalog = self._catalog_cache.popitem(last=False)
+        
+        try:
+            # Close DuckDB connection before evicting
+            catalog.close()
+            logger.info(f"Evicted and closed catalog for chat: {chat_id} (cache was full)")
+        except Exception as e:
+            logger.warning(f"Error closing catalog connection for chat {chat_id} during eviction: {e}")
+            # Continue eviction even if close fails
+
+    def close_all_catalogs(self):
+        """
+        Close all cached DuckDB catalog connections.
+        
+        Call this when shutting down or when you want to ensure all connections are closed.
+        """
+        closed_count = 0
+        for chat_id, catalog in list(self._catalog_cache.items()):
+            try:
+                catalog.close()
+                closed_count += 1
+            except Exception as e:
+                logger.warning(f"Error closing catalog for chat {chat_id}: {e}")
+        
+        self._catalog_cache.clear()
+        logger.info(f"Closed {closed_count} catalog connection(s)")
 
     def delete_chat_data(self, chat_id: str) -> bool:
         """
@@ -355,11 +420,11 @@ class ChatDataManager:
             return False
 
         try:
-            # Close catalog if cached in this instance
+            # Close catalog if cached in this instance and remove from cache
             if chat_id in self._catalog_cache:
                 try:
-                    self._catalog_cache[chat_id].close()
-                    del self._catalog_cache[chat_id]
+                    catalog = self._catalog_cache.pop(chat_id)
+                    catalog.close()
                     logger.info(f"Closed DuckDB catalog for chat {chat_id}")
                 except Exception as conn_err:
                     logger.warning(f"Error closing catalog connection: {conn_err}")

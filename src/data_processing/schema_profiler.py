@@ -2,7 +2,7 @@
 Schema Profiler
 Generates schema profiles and metadata for Parquet files to help LLM understand data structure.
 """
-
+#src/data_processing/schema_profiler.py
 import logging
 from pathlib import Path
 from typing import Dict, List, Any, Optional
@@ -70,7 +70,28 @@ class SchemaProfiler:
 
         # Add sample data
         sample_df = df.head(self.sample_rows)
-        profile["sample_data"] = sample_df.to_dict(orient='records')
+        sample_data = sample_df.to_dict(orient='records')
+        
+        # Convert Timestamps to ISO format strings for JSON compatibility
+        for row in sample_data:
+            for key, value in row.items():
+                if isinstance(value, pd.Timestamp):
+                    row[key] = value.isoformat()
+                elif value is None:
+                    row[key] = None
+                elif hasattr(value, '__len__') and not isinstance(value, (str, bytes)):
+                    # Skip array-like objects (lists, arrays, Series) - keep as-is
+                    pass
+                else:
+                    # Safely check for NaN/NaT (only for scalars)
+                    try:
+                        if pd.isna(value):
+                            row[key] = None
+                    except (ValueError, TypeError):
+                        # If pd.isna() fails (e.g., on arrays), keep the value as-is
+                        pass
+        
+        profile["sample_data"] = sample_data
 
         # Overall statistics
         profile["statistics"] = {

@@ -2,7 +2,7 @@
 Data Query Agent
 LangGraph-based agent for converting natural language queries to SQL and executing them.
 """
-
+#src/agents/data_query_agent.py
 import logging
 import json
 from typing import Dict, List, Any, Optional, TypedDict, Annotated
@@ -15,6 +15,8 @@ from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
 import sys
 from pathlib import Path
 sys.path.append(str(Path(__file__).parent.parent))
+
+import pandas as pd
 
 from data_processing.duckdb_catalog import DuckDBCatalog
 from utils.sql_validator import SQLValidator
@@ -166,6 +168,7 @@ class DataQueryAgent:
             self.check_execution,
             {
                 "format": "format_response",
+                "retry": "generate_sql",
                 "error": "handle_error"
             }
         )
@@ -236,6 +239,137 @@ class DataQueryAgent:
     def generate_sql_node(self, state: AgentState) -> AgentState:
         """Generate SQL query from natural language."""
         logger.info("Generating SQL query...")
+        
+        # Get error message for prompt BEFORE clearing it (for retry detection)
+        error_msg = state.get('validation_error') or state.get('execution_error') or 'N/A'
+        
+        # Detect if this is a retry (has validation_error or execution_error from previous attempt)
+        is_retry = bool(state.get("validation_error") or state.get("execution_error"))
+        
+        if is_retry:
+            # We're retrying - increment retry count and prepare state
+            current_retry_count = state.get("retry_count", 0)
+            max_retries = state.get("max_retries", self.max_retries)
+            
+            # Check if we've exceeded max retries
+            if current_retry_count >= max_retries:
+                logger.error(f"Max retries ({max_retries}) already reached. Stopping retry.")
+                # Don't generate SQL, just set error state
+                state["sql_query"] = None
+                state["execution_error"] = "Maximum retry attempts exceeded"
+                return state
+            
+            # Increment retry count
+            state["retry_count"] = current_retry_count + 1
+            logger.warning(f"Retrying SQL generation (attempt {state['retry_count']}/{max_retries})")
+            
+            # Ensure validation_error is set from execution_error if needed (preserve error_msg)
+            if state.get("execution_error") and not state.get("validation_error"):
+                state["validation_error"] = state.get("execution_error")
+            
+            # Clear execution state for fresh attempt (but keep validation_error for prompt)
+            state["execution_error"] = None
+            state["execution_success"] = False
+            state["query_results"] = None
+            # Reset validation state since we're generating new SQL
+            state["sql_valid"] = False
+        
+        # Build enhanced error guidance for GROUP BY and WHERE clause issues
+        error_guidance = ""
+        if error_msg and any(keyword in error_msg.upper() for keyword in ["GROUP BY", "MUST APPEAR", "AGGREGATE", "WHERE", "BINDER ERROR"]):
+            error_guidance = """
+
+═══════════════════════════════════════════════════════════════════
+CRITICAL SQL ERROR - READ THIS CAREFULLY BEFORE GENERATING SQL
+═══════════════════════════════════════════════════════════════════
+
+The previous query failed with a GROUP BY or WHERE clause error.
+
+═══════════════════════════════════════════════════════════════════
+ERROR 1: WHERE CLAUSE CANNOT USE COLUMN ALIASES
+═══════════════════════════════════════════════════════════════════
+
+CRITICAL RULE: You CANNOT use column aliases from SELECT in WHERE clause!
+- Aliases are only available in ORDER BY, HAVING, or subqueries
+- In WHERE clause, you MUST use the full expression
+
+WRONG (using alias in WHERE and GROUP BY):
+SELECT 
+    EXTRACT(YEAR FROM visit_date) AS year,
+    EXTRACT(MONTH FROM visit_date) AS month,
+    SUM(total_payment) AS total_payments
+FROM ar_analysis
+WHERE year = 2025  ← WRONG! Can't use alias 'year' in WHERE
+GROUP BY year, month  ← WRONG! Can't use aliases 'year', 'month' in GROUP BY (DuckDB requirement)
+
+CORRECT (using full expression in WHERE and GROUP BY):
+SELECT 
+    EXTRACT(YEAR FROM visit_date) AS year,
+    EXTRACT(MONTH FROM visit_date) AS month,
+    SUM(total_payment) AS total_payments
+FROM ar_analysis
+WHERE EXTRACT(YEAR FROM visit_date) = 2025  ← CORRECT! Use full expression in WHERE
+GROUP BY EXTRACT(YEAR FROM visit_date), EXTRACT(MONTH FROM visit_date)  ← CORRECT! Use full expressions in GROUP BY too!
+ORDER BY month
+
+═══════════════════════════════════════════════════════════════════
+ERROR 2: GROUP BY WITH DATE EXTRACTION (CRITICAL FOR DUCKDB)
+═══════════════════════════════════════════════════════════════════
+
+CRITICAL RULE: DuckDB does NOT allow using column aliases in GROUP BY clause!
+- You MUST use the FULL EXPRESSION in GROUP BY, not the alias
+- WRONG: GROUP BY year, month (using aliases)
+- CORRECT: GROUP BY EXTRACT(YEAR FROM visit_date), EXTRACT(MONTH FROM visit_date) (using full expressions)
+
+RULE: When you use EXTRACT() on a date column, you CANNOT select the original date column in SELECT unless you:
+  1. Include it in GROUP BY (which defeats the purpose of grouping by month/year), OR
+  2. Wrap it with ANY_VALUE(date_col) or MIN(date_col) or MAX(date_col)
+
+CORRECT EXAMPLE (break down payments by month for year 2025):
+SELECT 
+    EXTRACT(YEAR FROM visit_date) AS year,
+    EXTRACT(MONTH FROM visit_date) AS month,
+    SUM(total_payment) AS total_payments
+FROM ar_analysis
+WHERE EXTRACT(YEAR FROM visit_date) = 2025  ← Use full expression, not alias!
+GROUP BY EXTRACT(YEAR FROM visit_date), EXTRACT(MONTH FROM visit_date)  ← DUCKDB: Use full expressions in GROUP BY!
+ORDER BY month
+
+WRONG EXAMPLE 1 (using aliases in GROUP BY - DuckDB doesn't allow this):
+SELECT 
+    EXTRACT(YEAR FROM visit_date) AS year,
+    EXTRACT(MONTH FROM visit_date) AS month,
+    SUM(total_payment) AS total_payments
+FROM ar_analysis
+WHERE EXTRACT(YEAR FROM visit_date) = 2025
+GROUP BY year, month  ← WRONG! DuckDB requires full expressions in GROUP BY
+ORDER BY month
+
+WRONG EXAMPLE 2 (selecting original date column):
+SELECT 
+    EXTRACT(YEAR FROM visit_date) AS year,
+    EXTRACT(MONTH FROM visit_date) AS month,
+    visit_date,  ← THIS IS THE PROBLEM! Don't select visit_date here
+    SUM(total_payment) AS total_payments
+FROM ar_analysis
+WHERE EXTRACT(YEAR FROM visit_date) = 2025
+GROUP BY EXTRACT(YEAR FROM visit_date), EXTRACT(MONTH FROM visit_date)
+
+If you need the original date value, use:
+SELECT 
+    EXTRACT(YEAR FROM visit_date) AS year,
+    EXTRACT(MONTH FROM visit_date) AS month,
+    ANY_VALUE(visit_date) AS sample_date,  ← Use ANY_VALUE() wrapper
+    SUM(total_payment) AS total_payments
+FROM ar_analysis
+WHERE EXTRACT(YEAR FROM visit_date) = 2025
+GROUP BY EXTRACT(YEAR FROM visit_date), EXTRACT(MONTH FROM visit_date)  ← Use full expressions!
+
+KEY POINT: For "break down by month", you only need year, month, and aggregated values. You do NOT need the original date column.
+
+═══════════════════════════════════════════════════════════════════
+
+"""
 
         # Build system prompt
         system_prompt = f"""You are a SQL expert. Convert the natural language question into a DuckDB SQL query.
@@ -248,6 +382,19 @@ Rules:
 - Use proper table and column names exactly as shown
 - Always include appropriate WHERE clauses to filter data
 - Use aggregations (COUNT, SUM, AVG, etc.) when appropriate
+- WHERE clause rules (CRITICAL):
+  * You CANNOT use column aliases from SELECT in WHERE clause
+  * Use the full expression: WHERE EXTRACT(YEAR FROM date_col) = 2025, NOT WHERE year = 2025
+  * Aliases can only be used in ORDER BY, HAVING, or subqueries
+  * Example: SELECT EXTRACT(YEAR FROM visit_date) AS year ... WHERE EXTRACT(YEAR FROM visit_date) = 2025 (correct)
+  * Example: SELECT EXTRACT(YEAR FROM visit_date) AS year ... WHERE year = 2025 (WRONG!)
+- GROUP BY rules (CRITICAL for DuckDB):
+  * DuckDB does NOT allow using column aliases in GROUP BY clause - you MUST use the full expression
+  * When using GROUP BY, all non-aggregated columns in SELECT must appear in GROUP BY using their FULL EXPRESSION, not aliases
+  * When grouping by date parts (EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col)), use: GROUP BY EXTRACT(YEAR FROM date_col), EXTRACT(MONTH FROM date_col) - NOT GROUP BY year, month
+  * Only select the extracted values, not the original date column (unless wrapped in ANY_VALUE())
+  * Example: SELECT EXTRACT(YEAR FROM visit_date) AS year, EXTRACT(MONTH FROM visit_date) AS month, COUNT(*) FROM table WHERE EXTRACT(YEAR FROM visit_date) = 2025 GROUP BY EXTRACT(YEAR FROM visit_date), EXTRACT(MONTH FROM visit_date) ORDER BY month
+  * If you need the original date value, use ANY_VALUE(date_col) or MIN(date_col)
 - Return ONLY the SQL query without any explanation, markdown, or formatting
 - Do not include markdown code blocks or backticks
 - The query should be executable as-is
@@ -255,7 +402,7 @@ Rules:
 Previous conversation:
 {self._format_chat_history(state.get('chat_history', []))}
 
-If validation failed previously, fix this error: {state.get('validation_error', 'N/A')}
+If validation or execution failed previously, fix this error: {error_msg}{error_guidance}
 """
 
         # Generate SQL
@@ -356,6 +503,9 @@ If validation failed previously, fix this error: {state.get('validation_error', 
         rows = results.get("rows", [])
         row_count = results.get("row_count", 0)
 
+        # Serialize rows for JSON compatibility (safety net for any remaining Timestamps)
+        serialized_rows = self._serialize_for_json(rows[:10])
+
         # Build natural language response
         try:
             # Create summary prompt
@@ -366,7 +516,7 @@ User's question: {state['question']}
 SQL query used: {state.get('sql_query', 'N/A')}
 
 Results ({row_count} rows):
-{json.dumps(rows[:10], indent=2)}
+{json.dumps(serialized_rows, indent=2)}
 
 Provide a clear, concise answer that:
 1. Directly answers the question
@@ -397,10 +547,11 @@ Provide a clear, concise answer that:
         except Exception as e:
             logger.error(f"Error formatting response: {e}")
 
-            # Fallback response
+            # Fallback response - serialize sample data for safety
+            serialized_sample = self._serialize_for_json(rows[:3])
             state["answer"] = (
                 f"I found {row_count} result(s) but had trouble formatting the answer. "
-                f"Here's a sample: {json.dumps(rows[:3])}"
+                f"Here's a sample: {json.dumps(serialized_sample)}"
             )
 
         return state
@@ -409,19 +560,25 @@ Provide a clear, concise answer that:
         """Handle errors gracefully."""
         logger.info("Handling error...")
 
+        # Log technical error for debugging (but don't show to user)
         error_msg = (
             state.get("execution_error") or
             state.get("validation_error") or
             "An unknown error occurred"
         )
+        
+        # Log the technical error for debugging
+        logger.warning(f"Query failed with error: {error_msg}")
+        if state.get("sql_query"):
+            logger.warning(f"Failed SQL query: {state.get('sql_query')}")
 
+        # Return user-friendly message instead of technical error
         state["answer"] = (
-            f"I encountered an issue processing your question: {error_msg}. "
-            "Please try rephrasing your question or asking something else."
+            "I don't understand your question. Please try to be more specific."
         )
 
         state["metadata"] = {
-            "error": error_msg,
+            "error": error_msg,  # Keep technical error in metadata for debugging
             "sql_query": state.get("sql_query")
         }
 
@@ -440,11 +597,15 @@ Provide a clear, concise answer that:
         if state.get("sql_valid"):
             return "execute"
 
-        # Retry if under max retries
-        if state.get("retry_count", 0) < state.get("max_retries", self.max_retries):
-            state["retry_count"] = state.get("retry_count", 0) + 1
-            logger.info(f"Retrying SQL generation (attempt {state['retry_count']})")
+        # Check if we can retry (retry_count will be incremented in generate_sql_node)
+        current_retry_count = state.get("retry_count", 0)
+        max_retries = state.get("max_retries", self.max_retries)
+        
+        if current_retry_count < max_retries:
+            logger.info(f"Validation error detected - will retry (current: {current_retry_count}/{max_retries})")
             return "retry"
+        else:
+            logger.error(f"Max retries ({max_retries}) reached for validation error. Stopping retry loop.")
 
         return "error"
 
@@ -452,9 +613,58 @@ Provide a clear, concise answer that:
         """Check query execution result."""
         if state.get("execution_success"):
             return "format"
+        
+        # Check if this is a fixable SQL error (like GROUP BY issues) that should trigger retry
+        execution_error = state.get("execution_error", "")
+        if execution_error and any(keyword in execution_error.upper() for keyword in ["GROUP BY", "MUST APPEAR", "AGGREGATE"]):
+            # Get current retry count and max retries
+            current_retry_count = state.get("retry_count", 0)
+            max_retries = state.get("max_retries", self.max_retries)
+            
+            # Build enhanced error message with the failed SQL query
+            failed_sql = state.get("sql_query", "")
+            enhanced_error = execution_error
+            if failed_sql:
+                enhanced_error = f"{execution_error}\n\nFailed SQL query:\n{failed_sql}\n\nThis query is WRONG. Fix it by removing the original date column from SELECT or using ANY_VALUE()."
+            
+            # Move execution error to validation error so retry can see it
+            # This will be detected by generate_sql_node as a retry condition
+            state["validation_error"] = enhanced_error
+            
+            # Check if we can still retry (retry_count will be incremented in generate_sql_node)
+            if current_retry_count < max_retries:
+                logger.info(f"Execution error detected - will retry (current: {current_retry_count}/{max_retries})")
+                return "retry"
+            else:
+                logger.error(f"Max retries ({max_retries}) reached for execution error. Stopping retry loop.")
+        
         return "error"
 
     # ===== Helper methods =====
+
+    def _serialize_for_json(self, obj: Any) -> Any:
+        """
+        Convert pandas Timestamps and other non-serializable types to JSON-compatible formats.
+        
+        This is a safety net in case any Timestamps slip through from DuckDB results.
+        """
+        if isinstance(obj, pd.Timestamp):
+            return obj.isoformat()
+        elif obj is None:
+            return None
+        elif isinstance(obj, dict):
+            return {k: self._serialize_for_json(v) for k, v in obj.items()}
+        elif isinstance(obj, list):
+            return [self._serialize_for_json(item) for item in obj]
+        else:
+            # Safely check for NaN/NaT (only for scalars)
+            try:
+                if pd.isna(obj):
+                    return None
+            except (ValueError, TypeError):
+                # If pd.isna() fails (e.g., on arrays), keep the value as-is
+                pass
+        return obj
 
     def _format_chat_history(self, chat_history: List[Dict[str, str]]) -> str:
         """Format chat history for context."""
@@ -513,11 +723,40 @@ Provide a clear, concise answer that:
             "max_retries": self.max_retries
         }
 
-        # Run graph
-        final_state = self.graph.invoke(initial_state)
+        # Run graph with recursion limit to prevent infinite loops
+        try:
+            final_state = self.graph.invoke(initial_state)
+        except Exception as e:
+            if "recursion" in str(e).lower() or "limit" in str(e).lower():
+                logger.error(f"Graph recursion limit reached. This usually indicates an infinite retry loop.")
+                logger.error(f"Final state - retry_count: {initial_state.get('retry_count', 0)}, "
+                           f"validation_error: {initial_state.get('validation_error')}, "
+                           f"execution_error: {initial_state.get('execution_error')}")
+                # Return user-friendly error response
+                return {
+                    "answer": "I don't understand your question. Please try to be more specific.",
+                    "metadata": {
+                        "error": "Recursion limit reached - query generation failed after multiple retries",
+                        "sql_query": initial_state.get("sql_query"),
+                        "retry_count": initial_state.get("retry_count", 0)
+                    },
+                    "sql_query": initial_state.get("sql_query"),
+                    "success": False
+                }
+            raise
 
+        # Return user-friendly message if query failed
+        # (handle_error_node should have already set this, but ensure it's always user-friendly)
+        answer = final_state.get("answer", "")
+        if not final_state.get("execution_success", False):
+            # Query failed - always show user-friendly message
+            answer = "I don't understand your question. Please try to be more specific."
+        elif not answer or not answer.strip():
+            # No answer generated but query succeeded (shouldn't happen, but safety check)
+            answer = "I don't understand your question. Please try to be more specific."
+        
         return {
-            "answer": final_state.get("answer", "I couldn't process your question."),
+            "answer": answer,
             "metadata": final_state.get("metadata", {}),
             "sql_query": final_state.get("sql_query"),
             "success": final_state.get("execution_success", False)
