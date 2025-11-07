@@ -17,7 +17,19 @@ class FirebaseService:
     def __new__(cls):
         if cls._instance is None:
             cls._instance = super(FirebaseService, cls).__new__(cls)
-            cls._instance._initialize()
+            try:
+                cls._instance._initialize()
+            except Exception as e:
+                # Clear the instance on initialization failure to allow retry
+                cls._instance = None
+                raise
+        elif not hasattr(cls._instance, 'db'):
+            # Instance exists but wasn't properly initialized - retry
+            try:
+                cls._instance._initialize()
+            except Exception as e:
+                cls._instance = None
+                raise
         return cls._instance
     
     def _initialize(self):

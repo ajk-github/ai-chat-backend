@@ -20,6 +20,7 @@ import pandas as pd
 
 from data_processing.duckdb_catalog import DuckDBCatalog
 from utils.sql_validator import SQLValidator
+from agents.weekly_report_tool import WeeklyReportTool
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +55,10 @@ class AgentState(TypedDict):
     # Control
     retry_count: int
     max_retries: int
+
+    # Weekly report
+    is_weekly_report: bool
+    company_name: Optional[str]
 
 
 # ===== Agent Class =====
@@ -94,12 +99,15 @@ class DataQueryAgent:
             temperature=temperature
         )
 
-        # Initialize SQL validator
+        # Initialize SQL validator (no row limit - analyze entire dataset)
         self.validator = SQLValidator(
-            max_rows=1000,
+            max_rows=999999999,
             max_joins=3,
             pii_columns=["ssn", "password", "credit_card"]
         )
+
+        # Initialize weekly report tool
+        self.weekly_report_tool = WeeklyReportTool(duckdb_catalog)
 
         # Load schema profiles
         self.schema_profiles = self._load_schema_profiles()
@@ -132,6 +140,8 @@ class DataQueryAgent:
         workflow = StateGraph(AgentState)
 
         # Add nodes
+        workflow.add_node("detect_intent", self.detect_intent_node)
+        workflow.add_node("handle_weekly_report", self.handle_weekly_report_node)
         workflow.add_node("load_schema", self.load_schema_node)
         workflow.add_node("generate_sql", self.generate_sql_node)
         workflow.add_node("validate_sql", self.validate_sql_node)
@@ -140,8 +150,19 @@ class DataQueryAgent:
         workflow.add_node("handle_error", self.handle_error_node)
 
         # Define edges
-        workflow.set_entry_point("load_schema")
+        workflow.set_entry_point("detect_intent")
 
+        # Route based on intent detection
+        workflow.add_conditional_edges(
+            "detect_intent",
+            self.route_by_intent,
+            {
+                "weekly_report": "handle_weekly_report",
+                "normal_query": "load_schema"
+            }
+        )
+
+        workflow.add_edge("handle_weekly_report", END)
         workflow.add_edge("load_schema", "generate_sql")
 
         workflow.add_conditional_edges(
@@ -179,6 +200,79 @@ class DataQueryAgent:
         return workflow.compile()
 
     # ===== Nodes =====
+
+    def detect_intent_node(self, state: AgentState) -> AgentState:
+        """Detect if the question is asking for a weekly report."""
+        logger.info("Detecting intent...")
+
+        question = state["question"].lower()
+
+        # Check for weekly report patterns
+        weekly_patterns = [
+            "/weeklyreport",
+            "weekly report",
+            "weekly kpi",
+            "kpi report",
+            "weekly metrics",
+            "weekly summary",
+            "performance report"
+        ]
+
+        is_weekly_report = any(pattern in question for pattern in weekly_patterns)
+        state["is_weekly_report"] = is_weekly_report
+
+        # Extract company name if present
+        company_name = "Company"  # Default
+
+        # Check for --company_name pattern
+        if "--" in question:
+            parts = question.split("--")
+            if len(parts) > 1:
+                company_name = parts[1].strip().title()
+
+        # Check for common company name patterns
+        company_keywords = ["for", "company", "client"]
+        for keyword in company_keywords:
+            if keyword in question:
+                words = question.split()
+                try:
+                    idx = words.index(keyword)
+                    if idx + 1 < len(words):
+                        potential_company = words[idx + 1].strip(",.!?").title()
+                        if potential_company and not potential_company in ["the", "a", "an"]:
+                            company_name = potential_company
+                except:
+                    pass
+
+        state["company_name"] = company_name
+
+        logger.info(f"Intent detection: is_weekly_report={is_weekly_report}, company={company_name}")
+
+        return state
+
+    def handle_weekly_report_node(self, state: AgentState) -> AgentState:
+        """Handle weekly report generation."""
+        logger.info(f"Generating weekly report for {state.get('company_name', 'Company')}...")
+
+        try:
+            # Generate report
+            report = self.weekly_report_tool.generate_report(
+                company_name=state.get("company_name", "Company")
+            )
+
+            state["answer"] = report
+            state["execution_success"] = True
+            state["metadata"] = {
+                "report_type": "weekly_kpi",
+                "company": state.get("company_name", "Company")
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating weekly report: {e}")
+            state["answer"] = f"❌ Error generating weekly report: {str(e)}"
+            state["execution_success"] = False
+
+        return state
 
     def load_schema_node(self, state: AgentState) -> AgentState:
         """Load schema information for relevant tables."""
@@ -382,6 +476,8 @@ Rules:
 - Use proper table and column names exactly as shown
 - Always include appropriate WHERE clauses to filter data
 - Use aggregations (COUNT, SUM, AVG, etc.) when appropriate
+- DO NOT add LIMIT clauses - the system will handle row limits automatically
+- Analyze the ENTIRE dataset unless the user specifically asks for a sample or limit
 - WHERE clause rules (CRITICAL):
   * You CANNOT use column aliases from SELECT in WHERE clause
   * Use the full expression: WHERE EXTRACT(YEAR FROM date_col) = 2025, NOT WHERE year = 2025
@@ -468,8 +564,8 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
             return state
 
         try:
-            # Execute query
-            result = self.catalog.execute_query(sql_query, timeout=10, max_rows=1000)
+            # Execute query (no row limit - analyze entire dataset)
+            result = self.catalog.execute_query(sql_query, timeout=60, max_rows=999999999)
 
             state["query_results"] = result
             state["execution_success"] = result["success"]
@@ -585,6 +681,12 @@ Provide a clear, concise answer that:
         return state
 
     # ===== Conditional edges =====
+
+    def route_by_intent(self, state: AgentState) -> str:
+        """Route based on detected intent."""
+        if state.get("is_weekly_report", False):
+            return "weekly_report"
+        return "normal_query"
 
     def check_sql_generated(self, state: AgentState) -> str:
         """Check if SQL was generated successfully."""
@@ -720,7 +822,9 @@ Provide a clear, concise answer that:
             "answer": "",
             "metadata": {},
             "retry_count": 0,
-            "max_retries": self.max_retries
+            "max_retries": self.max_retries,
+            "is_weekly_report": False,
+            "company_name": None
         }
 
         # Run graph with recursion limit to prevent infinite loops

@@ -162,6 +162,32 @@ class SQLValidator:
         # Check if LIMIT exists
         has_limit = "LIMIT" in sql_upper
 
+        # If max_rows is very high (unlimited), remove any existing LIMIT
+        if self.max_rows >= 999999999:
+            if has_limit:
+                # Remove the LIMIT clause entirely to analyze full dataset
+                sanitized_sql = re.sub(
+                    r'\s*LIMIT\s+\d+\s*',
+                    ' ',
+                    sql,
+                    flags=re.IGNORECASE
+                ).rstrip()
+                warnings.append("Removed LIMIT clause to analyze entire dataset")
+
+                return {
+                    "valid": True,
+                    "sanitized_sql": sanitized_sql,
+                    "warnings": warnings
+                }
+            else:
+                # No LIMIT clause, and we want to analyze full dataset - don't add one
+                return {
+                    "valid": True,
+                    "sanitized_sql": sql,
+                    "warnings": warnings
+                }
+
+        # Normal behavior when max_rows is set to a reasonable limit
         if not has_limit:
             # Add LIMIT clause
             sanitized_sql = sql.rstrip(';').rstrip() + f" LIMIT {self.max_rows}"
