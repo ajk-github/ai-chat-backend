@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 from uuid import uuid4, UUID
 import os
 import tempfile
@@ -63,6 +63,8 @@ if str(SRC_DIR) not in sys.path:
 
 from data_processing.chat_data_manager import ChatDataManager
 from agents.data_query_agent import DataQueryAgent
+from data_processing.mysql_catalog import MySQLCatalog
+from agents.database_query_agent import DatabaseQueryAgent
 from .firebase_service import FirebaseService
 
 
@@ -170,6 +172,13 @@ class ChatRequest(BaseModel):
     def validate_chat_id(cls, v: str) -> str:
         """Validate chat_id is a valid UUID format."""
         return sanitize_chat_id(v)
+
+
+class DatabaseChatRequest(BaseModel):
+    """Request model for database chat endpoint."""
+    message: str
+    user_id: str
+    chat_history: Optional[List[Dict[str, str]]] = None
 
 
 async def verify_chat_ownership(chat_id: str, user_id: str) -> bool:
@@ -537,6 +546,111 @@ async def delete_chat(
             logging.getLogger(__name__).warning(f"Error cleaning up manager resources: {cleanup_err}")
 
 
+# Global MySQL catalog instance (singleton)
+_mysql_catalog: Optional[MySQLCatalog] = None
+
+
+def get_mysql_catalog() -> MySQLCatalog:
+    """
+    Get or create the global MySQL catalog instance.
+    
+    Returns:
+        MySQLCatalog instance
+    """
+    global _mysql_catalog
+    
+    if _mysql_catalog is None:
+        # Get database credentials from environment (REQUIRED - no defaults for security)
+        db_host = os.getenv("MYSQL_HOST")
+        db_user = os.getenv("MYSQL_USER")
+        db_password = os.getenv("MYSQL_PASSWORD")
+        db_name = os.getenv("MYSQL_DATABASE")
+        db_port = int(os.getenv("MYSQL_PORT", "3306"))  # Port can have default
+        
+        # Validate required credentials
+        if not all([db_host, db_user, db_password, db_name]):
+            missing = [k for k, v in {
+                "MYSQL_HOST": db_host,
+                "MYSQL_USER": db_user,
+                "MYSQL_PASSWORD": db_password,
+                "MYSQL_DATABASE": db_name
+            }.items() if not v]
+            raise ValueError(
+                f"Missing required MySQL environment variables: {', '.join(missing)}. "
+                "Please set them in your .env file or environment."
+            )
+        
+        _mysql_catalog = MySQLCatalog(
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            database=db_name,
+            port=db_port,
+            pool_size=5,
+            max_overflow=10,
+        )
+        logging.getLogger(__name__).info(f"MySQL catalog initialized for {db_host}/{db_name}")
+    
+    return _mysql_catalog
+
+
+@app.post("/api/db/chat")
+@limiter.limit(RATE_LIMITS["chat_per_hour"])
+@limiter.limit(RATE_LIMITS["chat_per_day"])
+@limiter.limit(RATE_LIMITS["chat_burst"])
+async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
+    """
+    Chat endpoint for database queries (MySQL).
+    
+    This endpoint allows users to ask natural language questions about the database,
+    which are converted to SQL queries and executed against the MySQL database.
+    """
+    # Sanitize user_id
+    user_id = sanitize_user_id(req.user_id)
+    
+    try:
+        # Get MySQL catalog
+        catalog = get_mysql_catalog()
+        
+        # Get OpenAI API key
+        openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_api_key:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+        
+        # Create database query agent
+        agent = DatabaseQueryAgent(
+            mysql_catalog=catalog,
+            openai_api_key=openai_api_key,
+        )
+        
+        # Process the question
+        result = await agent.ask(
+            req.message,
+            req.chat_history or []
+        )
+        
+        return {
+            "response": result.get("answer", ""),
+            "sql_query": result.get("sql_query"),
+            "metadata": result.get("metadata", {}),
+            "success": result.get("success", False),
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        logging.getLogger(__name__).error(f"Error processing database chat request: {e}", exc_info=True)
+        # Return more detailed error in development (you can remove this in production)
+        import traceback
+        if os.getenv("DEBUG", "false").lower() == "true":
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to process database chat request: {error_msg}\n{traceback.format_exc()}"
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to process database chat request: {error_msg}")
+
+
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
@@ -547,8 +661,28 @@ def cleanup_on_shutdown():
     """Cleanup function called on application shutdown."""
     logger = logging.getLogger(__name__)
     logger.info("Application shutting down - performing cleanup...")
+    
+    # Close MySQL catalog connection pool
+    global _mysql_catalog
+    if _mysql_catalog:
+        try:
+            import asyncio
+            # Try to close the pool (async operation)
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    # Can't use run_until_complete in a running loop
+                    logger.warning("Cannot close MySQL pool synchronously - event loop is running")
+                else:
+                    loop.run_until_complete(_mysql_catalog.close())
+            except RuntimeError:
+                # No event loop - create one
+                asyncio.run(_mysql_catalog.close())
+            logger.info("MySQL catalog connection pool closed")
+        except Exception as e:
+            logger.warning(f"Error closing MySQL catalog: {e}")
+    
     # Note: Individual ChatDataManager instances are cleaned up per-request
-    # This is a placeholder for any global cleanup needed in the future
     logger.info("Cleanup completed")
 
 
