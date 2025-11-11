@@ -383,19 +383,81 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
 
         try:
             # Execute query (async, but we're in a sync node)
-            # LangGraph nodes are synchronous, but we need to call async catalog.execute_query
-            # Use a thread pool with a new event loop to avoid conflicts with FastAPI's event loop
+            # Create a new connection in the thread's event loop instead of using the pool
+            # This avoids "attached to a different loop" errors
             import asyncio
             import concurrent.futures
+            from datetime import datetime
             
             def run_async_query():
-                """Run async query in a new event loop."""
+                """Run async query in a new event loop with a new connection."""
                 new_loop = asyncio.new_event_loop()
                 asyncio.set_event_loop(new_loop)
+                start_time = datetime.now()
                 try:
-                    return new_loop.run_until_complete(
-                        self.catalog.execute_query(sql_query, timeout=30, max_rows=1000)
-                    )
+                    async def execute():
+                        # Create a new connection in this loop (not using the pool from FastAPI's loop)
+                        try:
+                            import aiomysql
+                            conn = await aiomysql.connect(
+                                host=self.catalog.host,
+                                port=self.catalog.port,
+                                user=self.catalog.user,
+                                password=self.catalog.password,
+                                db=self.catalog.database,
+                                charset='utf8mb4',
+                                cursorclass=aiomysql.DictCursor,
+                            )
+                            try:
+                                async with conn.cursor() as cursor:
+                                    # Add LIMIT if not present
+                                    query_upper = sql_query.strip().upper()
+                                    if "LIMIT" not in query_upper:
+                                        final_query = sql_query.rstrip(';') + f" LIMIT 1000"
+                                    else:
+                                        final_query = sql_query
+                                    
+                                    await cursor.execute(final_query)
+                                    rows = await cursor.fetchall()
+                                    
+                                    # Convert to list of dicts
+                                    result_rows = []
+                                    for row in rows:
+                                        if isinstance(row, dict):
+                                            row_dict = {}
+                                            for key, value in row.items():
+                                                if hasattr(value, 'isoformat'):
+                                                    row_dict[key] = value.isoformat()
+                                                else:
+                                                    row_dict[key] = value
+                                            result_rows.append(row_dict)
+                                        else:
+                                            result_rows.append(row)
+                                    
+                                    column_names = list(result_rows[0].keys()) if result_rows else []
+                                    execution_time = (datetime.now() - start_time).total_seconds()
+                                    
+                                    return {
+                                        "success": True,
+                                        "rows": result_rows,
+                                        "row_count": len(result_rows),
+                                        "column_names": column_names,
+                                        "execution_time_seconds": execution_time,
+                                        "query": final_query
+                                    }
+                            finally:
+                                conn.close()
+                        except Exception as e:
+                            execution_time = (datetime.now() - start_time).total_seconds()
+                            logger.error(f"Query execution failed: {e}")
+                            return {
+                                "success": False,
+                                "error": str(e),
+                                "execution_time_seconds": execution_time,
+                                "query": sql_query
+                            }
+                    
+                    return new_loop.run_until_complete(execute())
                 finally:
                     new_loop.close()
             
@@ -413,7 +475,7 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
             else:
                 logger.info(
                     f"Query executed successfully: {result['row_count']} rows "
-                    f"in {result['execution_time_seconds']:.3f}s"
+                    f"in {result.get('execution_time_seconds', 0):.3f}s"
                 )
 
         except Exception as e:
