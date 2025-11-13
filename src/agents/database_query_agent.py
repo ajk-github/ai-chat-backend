@@ -410,12 +410,8 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
                             )
                             try:
                                 async with conn.cursor() as cursor:
-                                    # Add LIMIT if not present
-                                    query_upper = sql_query.strip().upper()
-                                    if "LIMIT" not in query_upper:
-                                        final_query = sql_query.rstrip(';') + f" LIMIT 1000"
-                                    else:
-                                        final_query = sql_query
+                                    # Remove automatic LIMIT - let queries run as-is
+                                    final_query = sql_query
                                     
                                     await cursor.execute(final_query)
                                     rows = await cursor.fetchall()

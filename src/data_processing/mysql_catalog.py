@@ -217,10 +217,6 @@ class MySQLCatalog:
                     "query": query
                 }
 
-            # Add LIMIT if not present
-            if "LIMIT" not in query_upper:
-                query = query.rstrip(';') + f" LIMIT {max_rows}"
-
             async with pool.acquire() as conn:
                 async with conn.cursor() as cursor:
                     # Execute query with timeout

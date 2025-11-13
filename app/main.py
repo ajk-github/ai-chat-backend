@@ -176,9 +176,15 @@ class ChatRequest(BaseModel):
 
 class DatabaseChatRequest(BaseModel):
     """Request model for database chat endpoint."""
+    chat_id: str
     message: str
     user_id: str
-    chat_history: Optional[List[Dict[str, str]]] = None
+    
+    @field_validator('chat_id')
+    @classmethod
+    def validate_chat_id(cls, v: str) -> str:
+        """Validate chat_id is a valid UUID format."""
+        return sanitize_chat_id(v)
 
 
 async def verify_chat_ownership(chat_id: str, user_id: str) -> bool:
@@ -594,6 +600,46 @@ def get_mysql_catalog() -> MySQLCatalog:
     return _mysql_catalog
 
 
+class CreateDatabaseChatRequest(BaseModel):
+    """Request model for creating a new database chat session."""
+    user_id: str
+
+
+@app.post("/api/db/chat/create")
+@limiter.limit(RATE_LIMITS["chat_per_hour"])
+async def create_db_chat(request: Request, req: CreateDatabaseChatRequest) -> Dict[str, Any]:
+    """
+    Create a new database chat session.
+    
+    This endpoint creates a new chat session in Firestore for database queries.
+    Returns the chat_id that should be used for subsequent /api/db/chat requests.
+    """
+    # Sanitize user_id
+    user_id = sanitize_user_id(req.user_id)
+    
+    # Generate new chat_id
+    chat_id = str(uuid4())
+    
+    try:
+        # Create chat session in Firestore
+        fb = FirebaseService()
+        await asyncio.to_thread(
+            fb.create_chat_session,
+            chat_id,
+            user_id,
+            "Database Query Chat",
+            "Database query chat session - ask questions about your database"
+        )
+        
+        return {
+            "chatId": chat_id,
+            "message": "Database chat session created successfully"
+        }
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Error creating database chat session: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create database chat session")
+
+
 @app.post("/api/db/chat")
 @limiter.limit(RATE_LIMITS["chat_per_hour"])
 @limiter.limit(RATE_LIMITS["chat_per_day"])
@@ -606,9 +652,44 @@ async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
     which are converted to SQL queries and executed against the MySQL database.
     """
     # Sanitize user_id
+    # chat_id is already validated by Pydantic validator
     user_id = sanitize_user_id(req.user_id)
     
+    # Verify chat ownership
+    if not await verify_chat_ownership(req.chat_id, user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Chat does not belong to user"
+        )
+    
     try:
+        # First, persist the user's message to Firestore before processing
+        try:
+            fb = FirebaseService()
+            await asyncio.to_thread(
+                fb.add_message,
+                req.chat_id,
+                user_id,
+                'user',
+                req.message,
+            )
+        except Exception as fb_err:
+            logging.getLogger(__name__).error(f"Firebase user message write failed for chat {req.chat_id}: {fb_err}")
+        
+        # Retrieve chat history from Firestore
+        chat_history = []
+        try:
+            messages = await asyncio.to_thread(fb.get_chat_messages, req.chat_id)
+            # Format for agent: only include user and assistant messages (exclude system)
+            chat_history = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in messages
+                if msg["role"] in ["user", "assistant"]
+            ]
+        except Exception as fb_err:
+            logging.getLogger(__name__).warning(f"Failed to retrieve chat history: {fb_err}")
+            # Continue with empty history
+        
         # Get MySQL catalog
         catalog = get_mysql_catalog()
         
@@ -623,11 +704,24 @@ async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
             openai_api_key=openai_api_key,
         )
         
-        # Process the question
+        # Process the question with chat history
         result = await agent.ask(
             req.message,
-            req.chat_history or []
+            chat_history
         )
+        
+        # Persist assistant response to Firestore
+        try:
+            fb = FirebaseService()
+            await asyncio.to_thread(
+                fb.add_message,
+                req.chat_id,
+                user_id,
+                'assistant',
+                result.get("answer", ""),
+            )
+        except Exception as fb_err:
+            logging.getLogger(__name__).error(f"Firebase message write failed for chat {req.chat_id}: {fb_err}")
         
         return {
             "response": result.get("answer", ""),
@@ -641,7 +735,6 @@ async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
     except Exception as e:
         error_msg = str(e)
         logging.getLogger(__name__).error(f"Error processing database chat request: {e}", exc_info=True)
-        # Return more detailed error in development (you can remove this in production)
         import traceback
         if os.getenv("DEBUG", "false").lower() == "true":
             raise HTTPException(
