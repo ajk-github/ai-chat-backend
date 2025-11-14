@@ -66,6 +66,7 @@ from agents.data_query_agent import DataQueryAgent
 from data_processing.mysql_catalog import MySQLCatalog
 from agents.database_query_agent import DatabaseQueryAgent
 from .firebase_service import FirebaseService
+from .database_manager import get_mysql_catalog_for_database, get_database_manager
 
 
 def sanitize_user_id(user_id: str) -> str:
@@ -179,12 +180,24 @@ class DatabaseChatRequest(BaseModel):
     chat_id: str
     message: str
     user_id: str
+    database: str  # Database identifier (e.g., "TELOS", "CLIENT1")
     
     @field_validator('chat_id')
     @classmethod
     def validate_chat_id(cls, v: str) -> str:
         """Validate chat_id is a valid UUID format."""
         return sanitize_chat_id(v)
+    
+    @field_validator('database')
+    @classmethod
+    def validate_database(cls, v: str) -> str:
+        """Validate database identifier."""
+        if not v or not v.strip():
+            raise ValueError("Database identifier cannot be empty")
+        # Allow alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in '-_' for c in v):
+            raise ValueError("Database identifier can only contain alphanumeric characters, hyphens, and underscores")
+        return v.strip().upper()
 
 
 async def verify_chat_ownership(chat_id: str, user_id: str) -> bool:
@@ -690,8 +703,20 @@ async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
             logging.getLogger(__name__).warning(f"Failed to retrieve chat history: {fb_err}")
             # Continue with empty history
         
-        # Get MySQL catalog
-        catalog = get_mysql_catalog()
+        # Get MySQL catalog for the specified database
+        try:
+            catalog = get_mysql_catalog_for_database(req.database)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Database configuration error: {str(e)}"
+            )
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Error getting database catalog for '{req.database}': {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to connect to database '{req.database}'. Please check the database configuration."
+            )
         
         # Get OpenAI API key
         openai_api_key = os.getenv("OPENAI_API_KEY", "")
@@ -749,31 +774,49 @@ async def health() -> Dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/api/db/databases")
+async def list_databases() -> Dict[str, Any]:
+    """
+    List all available database configurations.
+    
+    Returns a list of database IDs that have complete configurations.
+    """
+    try:
+        manager = get_database_manager()
+        databases = manager.list_available_databases()
+        return {
+            "databases": databases,
+            "count": len(databases)
+        }
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Error listing databases: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list databases")
+
+
 # Global cleanup function for graceful shutdown
 def cleanup_on_shutdown():
     """Cleanup function called on application shutdown."""
     logger = logging.getLogger(__name__)
     logger.info("Application shutting down - performing cleanup...")
     
-    # Close MySQL catalog connection pool
-    global _mysql_catalog
-    if _mysql_catalog:
+    # Close all database connection pools
+    try:
+        import asyncio
+        manager = get_database_manager()
+        # Try to close all pools (async operation)
         try:
-            import asyncio
-            # Try to close the pool (async operation)
-            try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    # Can't use run_until_complete in a running loop
-                    logger.warning("Cannot close MySQL pool synchronously - event loop is running")
-                else:
-                    loop.run_until_complete(_mysql_catalog.close())
-            except RuntimeError:
-                # No event loop - create one
-                asyncio.run(_mysql_catalog.close())
-            logger.info("MySQL catalog connection pool closed")
-        except Exception as e:
-            logger.warning(f"Error closing MySQL catalog: {e}")
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Can't use run_until_complete in a running loop
+                logger.warning("Cannot close database pools synchronously - event loop is running")
+            else:
+                loop.run_until_complete(manager.close_all())
+        except RuntimeError:
+            # No event loop - create one
+            asyncio.run(manager.close_all())
+        logger.info("All database connection pools closed")
+    except Exception as e:
+        logger.warning(f"Error closing database connection pools: {e}")
     
     # Note: Individual ChatDataManager instances are cleaned up per-request
     logger.info("Cleanup completed")
