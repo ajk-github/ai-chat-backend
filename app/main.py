@@ -641,7 +641,8 @@ async def create_db_chat(request: Request, req: CreateDatabaseChatRequest) -> Di
             chat_id,
             user_id,
             "Database Query Chat",
-            "Database query chat session - ask questions about your database"
+            "Database query chat session - ask questions about your database",
+            'database'  # Mark as database chat type
         )
         
         return {
@@ -772,6 +773,49 @@ async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/chat/info/{chat_id}")
+async def get_chat_info(chat_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    Get chat session information including chat type.
+    
+    This helps the frontend determine which endpoint to use:
+    - chatType: 'database' -> use /api/db/chat
+    - chatType: 'file' -> use /api/chat
+    """
+    # Sanitize inputs
+    user_id = sanitize_user_id(user_id)
+    chat_id = sanitize_chat_id(chat_id)
+    
+    # Verify ownership
+    if not await verify_chat_ownership(chat_id, user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Chat does not belong to user"
+        )
+    
+    try:
+        fb = FirebaseService()
+        chat = await asyncio.to_thread(fb.get_chat, chat_id)
+        
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Return chat info with chatType (defaults to 'file' for backward compatibility)
+        return {
+            "chatId": chat.get("chatId", chat_id),
+            "userId": chat.get("userId", user_id),
+            "title": chat.get("title", ""),
+            "chatType": chat.get("chatType", "file"),  # Default to 'file' for old chats
+            "createdAt": chat.get("createdAt"),
+            "updatedAt": chat.get("updatedAt"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Error getting chat info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get chat info")
 
 
 @app.get("/api/db/databases")

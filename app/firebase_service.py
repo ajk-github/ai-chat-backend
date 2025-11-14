@@ -59,7 +59,8 @@ class FirebaseService:
         chat_id: str, 
         user_id: str, 
         title: str,
-        summary: str
+        summary: str,
+        chat_type: str = 'file'  # 'file' or 'database'
     ) -> None:
         """Create a new chat session in Firestore under chatSessions/{chatId}"""
         chat_ref = self.db.collection('chatSessions').document(chat_id)
@@ -69,6 +70,7 @@ class FirebaseService:
             'chatId': chat_id,
             'userId': user_id,
             'title': title,
+            'chatType': chat_type,  # 'file' or 'database'
             'createdAt': firestore.SERVER_TIMESTAMP,
             'updatedAt': firestore.SERVER_TIMESTAMP,
         })
