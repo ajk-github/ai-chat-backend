@@ -2,7 +2,7 @@
 import firebase_admin
 from firebase_admin import credentials, firestore
 from datetime import datetime
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 import os
 import logging
@@ -71,7 +71,8 @@ class FirebaseService:
         chat_id: str, 
         user_id: str, 
         title: str,
-        summary: str
+        summary: str,
+        chat_type: str = 'file'  # 'file' or 'database'
     ) -> None:
         """Create a new chat session in Firestore under chatSessions/{chatId}"""
         chat_ref = self.db.collection('chatSessions').document(chat_id)
@@ -81,6 +82,7 @@ class FirebaseService:
             'chatId': chat_id,
             'userId': user_id,
             'title': title,
+            'chatType': chat_type,  # 'file' or 'database'
             'createdAt': firestore.SERVER_TIMESTAMP,
             'updatedAt': firestore.SERVER_TIMESTAMP,
         })
@@ -142,6 +144,38 @@ class FirebaseService:
         if doc.exists:
             return doc.to_dict()
         return None
+    
+    def get_chat_messages(self, chat_id: str) -> List[Dict[str, Any]]:
+        """Get all messages for a chat session, ordered by timestamp"""
+        messages_ref = (
+            self.db
+            .collection('chatSessions')
+            .document(chat_id)
+            .collection('messages')
+        )
+        
+        try:
+            # Order by timestamp ascending
+            messages = messages_ref.order_by('timestamp').stream()
+            
+            result = []
+            for msg in messages:
+                msg_data = msg.to_dict()
+                # Convert Firestore timestamp to dict format
+                if 'timestamp' in msg_data and hasattr(msg_data['timestamp'], 'timestamp'):
+                    msg_data['timestamp'] = msg_data['timestamp'].timestamp()
+                
+                result.append({
+                    'role': msg_data.get('role', 'user'),
+                    'content': msg_data.get('content', ''),
+                    'messageId': msg_data.get('messageId', msg.id),
+                    'timestamp': msg_data.get('timestamp')
+                })
+            
+            return result
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Failed to get messages for chat {chat_id}: {e}")
+            return []
     
     def delete_chat(self, chat_id: str, user_id: str) -> None:
         """Delete a chat and all its messages"""
