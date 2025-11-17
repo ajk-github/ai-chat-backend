@@ -53,7 +53,7 @@ class KPICalculator:
         """
         Calculate total visits/encounters.
 
-        Formula: ∑ Visits or Encounters
+        Formula: COUNT(*) WHERE visit_status IS NOT NULL
         """
         # Try multiple column names that might represent visits
         visit_columns = ['visits', 'encounters', 'visit', 'encounter', 'visit_count']
@@ -62,7 +62,13 @@ class KPICalculator:
             if col in self.df.columns:
                 return int(self.df[col].sum())
 
-        # If no specific visit column, count rows as encounters
+        # If no specific visit column, count rows where visit_status is not null
+        if 'visit_status' in self.df.columns:
+            visit_count = self.df['visit_status'].notna().sum()
+            logger.info(f"Counting visits where visit_status IS NOT NULL: {visit_count}")
+            return int(visit_count)
+
+        # Fallback: count all rows as encounters
         logger.warning("No visit/encounter column found. Using row count as visits.")
         return len(self.df)
 
@@ -72,6 +78,7 @@ class KPICalculator:
 
         Formula: ∑ Charges
         """
+        # Updated to match actual data column names
         charge_columns = ['charge', 'charges', 'total_charges', 'billed_amount', 'charge_amount']
 
         for col in charge_columns:
@@ -146,6 +153,7 @@ class KPICalculator:
 
         Formula: ∑ Payments
         """
+        # Updated to match actual data column names - "Total Payment" is the main column
         payment_columns = ['total_payment', 'payment', 'payments', 'collections', 'paid_amount', 'payment_amount']
 
         for col in payment_columns:
@@ -161,19 +169,19 @@ class KPICalculator:
         """
         Calculate gross collection rate.
 
-        Formula: (Total Payments ÷ Total Charges) × 100
+        Formula: Payments ÷ Charges × 100
 
-        Where:
-        - Total Charges = SUM(unit × cpt_amount) excluding certain CPT codes and status != 12
-        - Total Payments = SUM(payment amount) excluding transaction types 9, 10
+        Simple calculation without filters.
         """
-        # Calculate total charges with filters
-        total_charges = self._calculate_filtered_charges()
+        # Calculate total payments (simple, no filters)
+        total_payments = self.calculate_total_payments()
 
-        # Calculate total payments with filters
-        total_payments = self._calculate_filtered_payments()
+        # Calculate total charges (simple, no filters)
+        total_charges = self.calculate_total_charges()
 
-        return self._safe_divide(total_payments, total_charges, 0.0) * 100
+        result = self._safe_divide(total_payments, total_charges, 0.0) * 100
+        logger.info(f"Gross Collection Rate: ${total_payments:,.2f} / ${total_charges:,.2f} = {result:.2f}%")
+        return result
 
     def _calculate_filtered_charges(self) -> float:
         """
@@ -324,7 +332,6 @@ class KPICalculator:
         logger.info(f"  Total Payments: ${total_payments:,.2f}")
         logger.info(f"  Total Expected: ${total_expected_payments:,.2f}")
         logger.info(f"  NCR: {self._safe_divide(total_payments, total_expected_payments, 0.0) * 100:.2f}%")
-        logger.info(f"  Available columns: {list(self.df.columns)}")
 
         return self._safe_divide(total_payments, total_expected_payments, 0.0) * 100
 
@@ -426,26 +433,38 @@ class KPICalculator:
         """
         Calculate Days in AR (DAR).
 
-        Formula: (Total Balance) / (Average Daily Charges)
+        Formula: Ending AR ÷ Avg Daily Charges
 
         Where:
-        - Total Balance = Total Charges - Total Payments (Outstanding AR)
-        - Average Daily Charges = Total Charges / 365
+        - Ending AR = SUM(Balance) - outstanding AR
+        - Average Daily Charges = Total Charges ÷ 365 (annualized)
         """
-        # Calculate total charges (filtered)
-        total_charges = self._calculate_filtered_charges()
+        # Calculate Ending AR from Balance column
+        ending_ar = 0.0
+        balance_columns = ['balance', 'ar', 'ar_balance', 'outstanding_balance']
+        for col in balance_columns:
+            if col in self.df.columns:
+                ending_ar = float(self.df[col].sum())
+                logger.info(f"  Using column '{col}' for Ending AR: ${ending_ar:,.2f}")
+                break
 
-        # Calculate total payments (filtered)
-        total_payments = self._calculate_filtered_payments()
+        # If no balance column, calculate as Charges - Payments
+        if ending_ar == 0.0:
+            total_charges = self.calculate_total_charges()
+            total_payments = self.calculate_total_payments()
+            ending_ar = total_charges - total_payments
+            logger.info(f"  Calculated Ending AR as Charges - Payments: ${ending_ar:,.2f}")
 
-        # Calculate outstanding balance (AR)
-        outstanding_balance = total_charges - total_payments
+        # Calculate total charges
+        total_charges = self.calculate_total_charges()
 
         # Calculate average daily charges (annualized)
         avg_daily_charges = self._safe_divide(total_charges, 365, 0.0)
 
         # Calculate Days in AR
-        days_in_ar = self._safe_divide(outstanding_balance, avg_daily_charges, 0.0)
+        days_in_ar = self._safe_divide(ending_ar, avg_daily_charges, 0.0)
+
+        logger.info(f"Days in AR: ${ending_ar:,.2f} / (${total_charges:,.2f} / 365) = {days_in_ar:.1f} days")
 
         return int(round(days_in_ar))
 
@@ -603,6 +622,818 @@ class KPICalculator:
 
         logger.info(f"Weekly report generated successfully for {company_name}")
         return report
+
+    def calculate_billed_ar(self) -> float:
+        """
+        Calculate total Billed AR (Accounts Receivable that has been billed).
+
+        Formula: Sum of Balance where Claim Status or Visit Status indicates billed/submitted
+        Uses "Balance" column which represents outstanding AR for each claim.
+        """
+        # Updated to use "Claim Status" and "Visit Status" from actual data
+        status_columns = ['claim_status', 'visit_status', 'status', 'label']
+        # Updated to use "Balance" column for AR calculation
+        balance_columns = ['balance', 'ar', 'ar_balance', 'outstanding_balance']
+
+        status_col = None
+        for col in status_columns:
+            if col in self.df.columns:
+                status_col = col
+                break
+
+        balance_col = None
+        for col in balance_columns:
+            if col in self.df.columns:
+                balance_col = col
+                break
+
+        if status_col and balance_col:
+            try:
+                # Billed AR = outstanding balance where claim has been created/submitted
+                billed_mask = self.df[status_col].astype(str).str.lower().str.contains(
+                    'claim created|submitted|billed|pending|claim submitted', na=False
+                )
+                return float(self.df.loc[billed_mask, balance_col].sum())
+            except Exception as e:
+                logger.warning(f"Error calculating billed AR from balance: {e}")
+
+        # Fallback: use balance column total if available
+        if balance_col:
+            return float(self.df[balance_col].sum())
+
+        # Final fallback: calculate as charges - payments
+        total_charges = self.calculate_total_charges()
+        total_payments = self.calculate_total_payments()
+        return total_charges - total_payments
+
+    def calculate_unbilled_ar(self) -> float:
+        """
+        Calculate total Unbilled AR (charges not yet billed).
+
+        Formula: Sum of Balance where Claim Status or Visit Status indicates NOT billed/submitted
+        """
+        # Updated to use "Claim Status" and "Visit Status" from actual data
+        status_columns = ['claim_status', 'visit_status', 'status', 'label']
+        # Updated to use "Balance" column for AR calculation
+        balance_columns = ['balance', 'ar', 'ar_balance', 'outstanding_balance']
+
+        status_col = None
+        for col in status_columns:
+            if col in self.df.columns:
+                status_col = col
+                break
+
+        balance_col = None
+        for col in balance_columns:
+            if col in self.df.columns:
+                balance_col = col
+                break
+
+        if status_col and balance_col:
+            try:
+                # Unbilled AR = outstanding balance where claim has NOT been created/submitted yet
+                unbilled_mask = ~self.df[status_col].astype(str).str.lower().str.contains(
+                    'claim created|submitted|billed|pending|claim submitted', na=False
+                )
+                return float(self.df.loc[unbilled_mask, balance_col].sum())
+            except Exception as e:
+                logger.warning(f"Error calculating unbilled AR from balance: {e}")
+
+        # Fallback: calculate as total charges - billed AR
+        total_charges = self.calculate_total_charges()
+        billed_ar = self.calculate_billed_ar()
+        return max(0.0, total_charges - billed_ar)
+
+    def calculate_billed_ar_percentage(self) -> float:
+        """
+        Calculate percentage of AR that has been billed.
+
+        Formula: (Billed AR / Total Balance) × 100
+        """
+        billed_ar = self.calculate_billed_ar()
+        unbilled_ar = self.calculate_unbilled_ar()
+        total_ar = billed_ar + unbilled_ar
+        return self._safe_divide(billed_ar, total_ar, 0.0) * 100
+
+    def calculate_unbilled_ar_percentage(self) -> float:
+        """
+        Calculate percentage of AR that is unbilled.
+
+        Formula: (Unbilled AR / Total Balance) × 100
+        """
+        billed_ar = self.calculate_billed_ar()
+        unbilled_ar = self.calculate_unbilled_ar()
+        total_ar = billed_ar + unbilled_ar
+        return self._safe_divide(unbilled_ar, total_ar, 0.0) * 100
+
+    def generate_weekly_breakdown_report(self, company_name: str = "Company", year: int = None, month: int = None) -> Dict[str, Any]:
+        """
+        Generate a weekly breakdown report for a specific month.
+
+        Args:
+            company_name: Name of the company for the report
+            year: Year to report on (if None, auto-detects latest month with data)
+            month: Month to report on (if None, auto-detects latest month with data)
+
+        Returns:
+            Dictionary containing weekly breakdown metrics
+        """
+        logger.info(f"Generating weekly breakdown report for {company_name}...")
+
+        # Find date column
+        date_col = None
+        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date', 'transaction_date', 'claim_date']
+        for col in date_columns:
+            if col in self.df.columns:
+                date_col = col
+                break
+
+        if date_col is None:
+            logger.warning("No date column found. Cannot generate weekly breakdown report.")
+            return {
+                "company": company_name,
+                "year": year,
+                "month": month,
+                "generated_at": datetime.now().isoformat(),
+                "error": "No date field found in data.",
+                "weeks": {}
+            }
+
+        try:
+            # Parse dates
+            df_copy = self.df.copy()
+            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+            df_copy = df_copy[df_copy[date_col].notna()]
+
+            if df_copy.empty:
+                return {
+                    "company": company_name,
+                    "year": year,
+                    "month": month,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No valid dates found in data.",
+                    "weeks": {}
+                }
+
+            # Auto-detect latest year/month if not specified
+            if year is None or month is None:
+                latest_date = df_copy[date_col].max()
+                year = latest_date.year
+                month = latest_date.month
+                logger.info(f"Auto-detected latest month: {year}-{month:02d}")
+
+            # Filter for specific year and month
+            df_filtered = df_copy[
+                (df_copy[date_col].dt.year == year) &
+                (df_copy[date_col].dt.month == month)
+            ]
+
+            if df_filtered.empty:
+                return {
+                    "company": company_name,
+                    "year": year,
+                    "month": month,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": f"No data found for {year}-{month:02d}.",
+                    "weeks": {}
+                }
+
+            # Add week number (week of month)
+            df_filtered['day_of_month'] = df_filtered[date_col].dt.day
+            df_filtered['week_of_month'] = ((df_filtered['day_of_month'] - 1) // 7) + 1
+
+            # Group by week of month and calculate individual week metrics first
+            weekly_data = {}
+            weeks_sorted = sorted(df_filtered['week_of_month'].unique())
+
+            # Calculate individual week metrics
+            week_metrics = {}
+            for week_num in weeks_sorted:
+                week_df = df_filtered[df_filtered['week_of_month'] == week_num]
+                week_calc = KPICalculator(week_df)
+
+                week_metrics[int(week_num)] = {
+                    "visits": week_calc.calculate_total_visits(),
+                    "collections": week_calc._calculate_filtered_payments(),  # Use filtered payments
+                    "expected": week_calc._calculate_expected_payments(),  # Use filtered expected payments
+                }
+
+            # Calculate cumulative values
+            cumulative_visits = 0
+            cumulative_collections = 0
+            cumulative_expected = 0
+
+            for week_num in weeks_sorted:
+                metrics = week_metrics[int(week_num)]
+
+                # Add this week's values to cumulative totals
+                cumulative_visits += metrics["visits"]
+                cumulative_collections += metrics["collections"]
+                cumulative_expected += metrics["expected"]
+
+                weekly_data[f"week_{int(week_num)}"] = {
+                    "week": int(week_num),
+                    "visits": cumulative_visits,  # Cumulative
+                    "collections": cumulative_collections,  # Cumulative
+                    "forecasted": cumulative_expected,  # Cumulative expected payments
+                }
+
+            logger.info(f"Weekly breakdown report generated for {year}-{month:02d}")
+            return {
+                "company": company_name,
+                "year": year,
+                "month": month,
+                "month_name": datetime(year, month, 1).strftime('%B'),
+                "generated_at": datetime.now().isoformat(),
+                "weeks": weekly_data
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating weekly breakdown report: {e}", exc_info=True)
+            return {
+                "company": company_name,
+                "year": year,
+                "month": month,
+                "generated_at": datetime.now().isoformat(),
+                "error": f"Error generating weekly breakdown: {str(e)}",
+                "weeks": {}
+            }
+
+    def format_weekly_breakdown_as_text(self, report: Dict[str, Any]) -> str:
+        """
+        Format the weekly breakdown report as human-readable text.
+
+        Args:
+            report: Report dictionary from generate_weekly_breakdown_report()
+
+        Returns:
+            Formatted text weekly breakdown report
+        """
+        company = report["company"]
+        year = report.get("year")
+        month_name = report.get("month_name", "")
+
+        if "error" in report:
+            return f"❌ Error: {report['error']}"
+
+        weeks = report.get("weeks", {})
+
+        if not weeks:
+            return f"❌ No weekly data available for {month_name} {year}."
+
+        # Sort weeks
+        sorted_weeks = sorted(weeks.items(), key=lambda x: x[1]['week'])
+
+        # Format output
+        output = f"""
+╔══════════════════════════════════════════════════════════════╗
+║          {company.upper()} - WEEKLY BREAKDOWN
+║          {month_name} {year}
+╚══════════════════════════════════════════════════════════════╝
+
+WEEKLY COLLECTIONS - {month_name} {year}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Forecasted              Week         Week Actual
+────────────────────────────────────────────────────────────────"""
+
+        for week_key, week_data in sorted_weeks:
+            week_num = week_data['week']
+            forecasted = week_data.get('forecasted', 0)
+            collections = week_data['collections']
+            output += f"\n${forecasted:,.2f}".ljust(24) + f"Week {week_num}".ljust(13) + f"${collections:,.2f}"
+
+        output += f"""
+
+
+WEEKLY VISITS BREAKDOWN - {month_name} {year}
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Week                              Visits (Cumulative)
+────────────────────────────────────────────────────────────────"""
+
+        for week_key, week_data in sorted_weeks:
+            week_num = week_data['week']
+            visits = week_data['visits']
+            output += f"\nWeek {week_num}                           {visits:,}"
+
+        output += f"\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        output += f"Generated: {report['generated_at']}\n"
+
+        return output.strip()
+
+    def generate_yearly_report(self, company_name: str = "Company") -> Dict[str, Any]:
+        """
+        Generate a yearly KPI report grouped by year.
+
+        Args:
+            company_name: Name of the company for the report
+
+        Returns:
+            Dictionary containing yearly KPI metrics organized by year
+        """
+        logger.info(f"Generating yearly report for {company_name}...")
+
+        # Check if Year column already exists
+        has_year_col = 'year' in self.df.columns
+
+        df_copy = self.df.copy()
+        use_date_fallback = False
+
+        if has_year_col:
+            # Use pre-calculated Year column
+            logger.info("Using pre-calculated Year column")
+            logger.info(f"Total rows before filtering: {len(df_copy)}")
+
+            # Ensure it's numeric
+            if not pd.api.types.is_numeric_dtype(df_copy['year']):
+                df_copy['year'] = pd.to_numeric(df_copy['year'], errors='coerce')
+
+            # Remove rows with invalid year
+            valid_rows = df_copy['year'].notna().sum()
+            logger.info(f"Rows with valid year: {valid_rows}")
+
+            if valid_rows == 0 or valid_rows < len(df_copy) * 0.5:
+                logger.warning(f"Too many null values in Year column. Falling back to date parsing.")
+                use_date_fallback = True
+            else:
+                df_copy = df_copy[df_copy['year'].notna()]
+                logger.info(f"Total rows after filtering: {len(df_copy)}")
+        else:
+            use_date_fallback = True
+
+        if use_date_fallback:
+            # Fallback: Find date column and extract year
+            date_col = None
+            date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date', 'transaction_date', 'claim_date']
+            for col in date_columns:
+                if col in self.df.columns:
+                    date_col = col
+                    break
+
+            if date_col is None:
+                logger.warning("No Year column or date column found. Cannot generate yearly report.")
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No Year column or date field found in data.",
+                    "years": {}
+                }
+
+            try:
+                df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+                df_copy = df_copy[df_copy[date_col].notna()]
+
+                if df_copy.empty:
+                    return {
+                        "company": company_name,
+                        "generated_at": datetime.now().isoformat(),
+                        "error": "No valid dates found in data.",
+                        "years": {}
+                    }
+
+                df_copy['year'] = df_copy[date_col].dt.year
+
+            except Exception as e:
+                logger.error(f"Error parsing dates: {e}")
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": f"Error parsing dates: {str(e)}",
+                    "years": {}
+                }
+
+        try:
+            if df_copy.empty:
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No valid data after filtering.",
+                    "years": {}
+                }
+
+            # Group by year
+            yearly_data = {}
+
+            for year, group_df in df_copy.groupby('year'):
+                # Create a temporary calculator for this year's data
+                year_calc = KPICalculator(group_df)
+
+                year_key = f"{int(year)}"
+                yearly_data[year_key] = {
+                    "year": int(year),
+                    "kpis": {
+                        "visits": year_calc.calculate_total_visits(),
+                        "charges": year_calc.calculate_total_charges(),
+                        "charges_submitted_pct": round(year_calc.calculate_charges_submitted_pct(), 2),
+                        "payments": year_calc.calculate_total_payments(),
+                        "gross_collection_rate_pct": round(year_calc.calculate_gross_collection_rate(), 2),
+                        "net_collection_rate_pct": round(year_calc.calculate_net_collection_rate(), 2),
+                        "days_in_ar": year_calc.calculate_days_in_ar(),
+                        "billed_ar": year_calc.calculate_billed_ar(),
+                        "unbilled_ar": year_calc.calculate_unbilled_ar(),
+                        "denial_resolution_rate_pct": round(year_calc.calculate_denial_resolution_rate(), 2),
+                    }
+                }
+
+            logger.info(f"Yearly report generated successfully for {company_name}")
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "years": yearly_data
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating yearly report: {e}", exc_info=True)
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "error": f"Error generating yearly report: {str(e)}",
+                "years": {}
+            }
+
+    def format_yearly_report_as_text(self, report: Dict[str, Any]) -> str:
+        """
+        Format the yearly report as human-readable text.
+
+        Args:
+            report: Report dictionary from generate_yearly_report()
+
+        Returns:
+            Formatted text yearly report
+        """
+        company = report["company"]
+
+        if "error" in report:
+            return f"❌ Error: {report['error']}"
+
+        years = report.get("years", {})
+
+        if not years:
+            return "❌ No yearly data available."
+
+        # Format output
+        output = f"""
+╔══════════════════════════════════════════════════════════════╗
+║          {company.upper()} - YEAR OVER YEAR KPI REPORT
+╚══════════════════════════════════════════════════════════════╝
+
+Type                        """
+
+        # Header row with years
+        sorted_years = sorted(years.keys())
+        for year in sorted_years:
+            output += f"{year}            "
+        output += "\n"
+        output += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+
+        # Get KPIs for each year
+        years_kpis = [years[year]["kpis"] for year in sorted_years]
+
+        # Visits
+        output += "Visits                      "
+        for kpis in years_kpis:
+            output += f"{kpis.get('visits', 0):,}".ljust(17)
+        output += "\n"
+
+        # Charges
+        output += "Charges                     "
+        for kpis in years_kpis:
+            output += f"${kpis.get('charges', 0):,.2f}".ljust(17)
+        output += "\n"
+
+        # Charges Submitted %
+        output += "Charges Submitted (%)       "
+        for kpis in years_kpis:
+            output += f"{kpis.get('charges_submitted_pct', 0):.2f}%".ljust(17)
+        output += "\n"
+
+        # Payments
+        output += "Payments                    "
+        for kpis in years_kpis:
+            output += f"${kpis.get('payments', 0):,.2f}".ljust(17)
+        output += "\n"
+
+        # Gross Collection Rate
+        output += "Gross Collection Rate (%)   "
+        for kpis in years_kpis:
+            output += f"{kpis.get('gross_collection_rate_pct', 0):.2f}%".ljust(17)
+        output += "\n"
+
+        # Net Collection Rate
+        output += "Net Collection Rate (%)     "
+        for kpis in years_kpis:
+            output += f"{kpis.get('net_collection_rate_pct', 0):.2f}%".ljust(17)
+        output += "\n"
+
+        # Days in AR
+        output += "Days in AR (DAR)            "
+        for kpis in years_kpis:
+            output += f"{kpis.get('days_in_ar', 0)} Days".ljust(17)
+        output += "\n"
+
+        # Billed AR
+        output += "Billed AR                   "
+        for kpis in years_kpis:
+            output += f"${kpis.get('billed_ar', 0):,.2f}".ljust(17)
+        output += "\n"
+
+        # Unbilled AR
+        output += "Unbilled AR                 "
+        for kpis in years_kpis:
+            output += f"${kpis.get('unbilled_ar', 0):,.2f}".ljust(17)
+        output += "\n"
+
+        # Denial vs Resolution
+        output += "Denial vs Resolution (%)    "
+        for kpis in years_kpis:
+            output += f"{kpis.get('denial_resolution_rate_pct', 0):.2f}%".ljust(17)
+        output += "\n"
+
+        output += "\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        output += f"Generated: {report['generated_at']}\n"
+
+        return output.strip()
+
+    def generate_quarterly_report(self, company_name: str = "Company") -> Dict[str, Any]:
+        """
+        Generate a quarterly KPI report grouped by year and quarter.
+
+        Args:
+            company_name: Name of the company for the report
+
+        Returns:
+            Dictionary containing quarterly KPI metrics organized by year and quarter
+        """
+        logger.info(f"Generating quarterly report for {company_name}...")
+
+        # Check if Year and Quarter columns already exist (preferred method)
+        has_year_col = 'year' in self.df.columns
+        has_quarter_col = 'quarter' in self.df.columns
+
+        df_copy = self.df.copy()
+        use_date_fallback = False
+
+        if has_year_col and has_quarter_col:
+            # Use pre-calculated Year and Quarter columns
+            logger.info("Using pre-calculated Year and Quarter columns")
+            logger.info(f"Total rows before filtering: {len(df_copy)}")
+
+            # Check original data types
+            logger.info(f"Year column dtype: {df_copy['year'].dtype}")
+            logger.info(f"Quarter column dtype: {df_copy['quarter'].dtype}")
+            logger.info(f"Year sample values: {df_copy['year'].head(10).tolist()}")
+            logger.info(f"Quarter sample values: {df_copy['quarter'].head(10).tolist()}")
+
+            # Try to convert to numeric - keep original if already numeric
+            if not pd.api.types.is_numeric_dtype(df_copy['year']):
+                df_copy['year'] = pd.to_numeric(df_copy['year'], errors='coerce')
+            if not pd.api.types.is_numeric_dtype(df_copy['quarter']):
+                df_copy['quarter'] = pd.to_numeric(df_copy['quarter'], errors='coerce')
+
+            # Log data quality info
+            year_nulls = df_copy['year'].isna().sum()
+            quarter_nulls = df_copy['quarter'].isna().sum()
+            valid_rows = ((df_copy['year'].notna()) & (df_copy['quarter'].notna())).sum()
+
+            logger.info(f"Year column null count: {year_nulls}/{len(df_copy)}")
+            logger.info(f"Quarter column null count: {quarter_nulls}/{len(df_copy)}")
+            logger.info(f"Rows with valid year AND quarter: {valid_rows}")
+
+            # If too many nulls, fall back to date parsing
+            if valid_rows == 0 or valid_rows < len(df_copy) * 0.5:  # If 0 or more than 50% are null
+                logger.warning(f"Too many null values in Year/Quarter columns ({valid_rows}/{len(df_copy)} valid). Falling back to date parsing.")
+                use_date_fallback = True
+            else:
+                # Remove rows with invalid year/quarter
+                df_copy = df_copy[df_copy['year'].notna() & df_copy['quarter'].notna()]
+                logger.info(f"Total rows after filtering: {len(df_copy)}")
+        else:
+            use_date_fallback = True
+
+        if use_date_fallback:
+            # Fallback: Find date column and calculate year/quarter
+            date_col = None
+            date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date', 'transaction_date', 'claim_date']
+            for col in date_columns:
+                if col in self.df.columns:
+                    date_col = col
+                    break
+
+            if date_col is None:
+                logger.warning("No Year/Quarter columns or date column found. Cannot generate quarterly report.")
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No Year/Quarter columns or date field found in data.",
+                    "quarters": {}
+                }
+
+            try:
+                # Parse dates and extract year/quarter
+                df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+                df_copy = df_copy[df_copy[date_col].notna()]
+
+                if df_copy.empty:
+                    return {
+                        "company": company_name,
+                        "generated_at": datetime.now().isoformat(),
+                        "error": "No valid dates found in data.",
+                        "quarters": {}
+                    }
+
+                df_copy['year'] = df_copy[date_col].dt.year
+                df_copy['quarter'] = df_copy[date_col].dt.quarter
+
+            except Exception as e:
+                logger.error(f"Error parsing dates: {e}")
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": f"Error parsing dates: {str(e)}",
+                    "quarters": {}
+                }
+
+        try:
+            if df_copy.empty:
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No valid data after filtering.",
+                    "quarters": {}
+                }
+
+            # Group by year and quarter
+            quarterly_data = {}
+
+            for (year, quarter), group_df in df_copy.groupby(['year', 'quarter']):
+                # Create a temporary calculator for this quarter's data
+                quarter_calc = KPICalculator(group_df)
+
+                quarter_key = f"{int(year)}_Q{int(quarter)}"
+                quarterly_data[quarter_key] = {
+                    "year": int(year),
+                    "quarter": int(quarter),
+                    "kpis": {
+                        "visits": quarter_calc.calculate_total_visits(),
+                        "charges": quarter_calc.calculate_total_charges(),
+                        "charges_submitted_pct": round(quarter_calc.calculate_charges_submitted_pct(), 2),
+                        "payments": quarter_calc.calculate_total_payments(),
+                        "gross_collection_rate_pct": round(quarter_calc.calculate_gross_collection_rate(), 2),
+                        "net_collection_rate_pct": round(quarter_calc.calculate_net_collection_rate(), 2),
+                        "days_in_ar": quarter_calc.calculate_days_in_ar(),
+                        "billed_ar": quarter_calc.calculate_billed_ar(),
+                        "billed_ar_pct": round(quarter_calc.calculate_billed_ar_percentage(), 2),
+                        "unbilled_ar": quarter_calc.calculate_unbilled_ar(),
+                        "unbilled_ar_pct": round(quarter_calc.calculate_unbilled_ar_percentage(), 2),
+                        "denial_resolution_rate_pct": round(quarter_calc.calculate_denial_resolution_rate(), 2),
+                    }
+                }
+
+            logger.info(f"Quarterly report generated successfully for {company_name}")
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "quarters": quarterly_data
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating quarterly report: {e}", exc_info=True)
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "error": f"Error generating quarterly report: {str(e)}",
+                "quarters": {}
+            }
+
+    def format_quarterly_report_as_text(self, report: Dict[str, Any]) -> str:
+        """
+        Format the quarterly report as human-readable text.
+
+        Args:
+            report: Report dictionary from generate_quarterly_report()
+
+        Returns:
+            Formatted text quarterly report
+        """
+        company = report["company"]
+
+        if "error" in report:
+            return f"❌ Error: {report['error']}"
+
+        quarters = report.get("quarters", {})
+
+        if not quarters:
+            return "❌ No quarterly data available."
+
+        # Group quarters by year
+        years = {}
+        for quarter_key, quarter_data in quarters.items():
+            year = quarter_data["year"]
+            if year not in years:
+                years[year] = {}
+            years[year][quarter_data["quarter"]] = quarter_data["kpis"]
+
+        # Format output
+        output = f"""
+╔══════════════════════════════════════════════════════════════╗
+║          {company.upper()} - QUARTERLY KPI REPORT
+╚══════════════════════════════════════════════════════════════╝
+
+"""
+
+        for year in sorted(years.keys()):
+            output += f"📅 {year}\n"
+            output += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\n"
+            output += "Type                        "
+
+            # Header row with quarters
+            for q in sorted(years[year].keys()):
+                output += f"Q{q}              "
+            output += "\n"
+            output += "────────────────────────────────────────────────────────────────\n"
+
+            # Get all quarters for this year (sorted)
+            quarters_list = [years[year].get(q, {}) for q in sorted(years[year].keys())]
+
+            # Visits
+            output += f"Visits                      "
+            for kpis in quarters_list:
+                output += f"{kpis.get('visits', 0):,}".ljust(17)
+            output += "\n"
+
+            # Charges
+            output += f"Charges                     "
+            for kpis in quarters_list:
+                output += f"${kpis.get('charges', 0):,.2f}".ljust(17)
+            output += "\n"
+
+            # Charges Submitted %
+            output += f"Charges Submitted (%)       "
+            for kpis in quarters_list:
+                output += f"{kpis.get('charges_submitted_pct', 0):.2f}%".ljust(17)
+            output += "\n"
+
+            # Payments
+            output += f"Payments                    "
+            for kpis in quarters_list:
+                output += f"${kpis.get('payments', 0):,.2f}".ljust(17)
+            output += "\n"
+
+            # Gross Collection Rate
+            output += f"Gross Collection Rate (%)   "
+            for kpis in quarters_list:
+                output += f"{kpis.get('gross_collection_rate_pct', 0):.2f}%".ljust(17)
+            output += "\n"
+
+            # Net Collection Rate
+            output += f"Net Collection Rate (%)     "
+            for kpis in quarters_list:
+                output += f"{kpis.get('net_collection_rate_pct', 0):.2f}%".ljust(17)
+            output += "\n"
+
+            # Days in AR
+            output += f"Days in AR (DAR)            "
+            for kpis in quarters_list:
+                output += f"{kpis.get('days_in_ar', 0)} Days".ljust(17)
+            output += "\n"
+
+            # Billed AR
+            output += f"Billed AR                   "
+            for kpis in quarters_list:
+                output += f"${kpis.get('billed_ar', 0):,.2f}".ljust(17)
+            output += "\n"
+
+            # Billed AR %
+            output += f"Billed AR %                 "
+            for kpis in quarters_list:
+                output += f"{kpis.get('billed_ar_pct', 0):.2f}%".ljust(17)
+            output += "\n"
+
+            # Unbilled AR
+            output += f"Unbilled AR                 "
+            for kpis in quarters_list:
+                output += f"${kpis.get('unbilled_ar', 0):,.2f}".ljust(17)
+            output += "\n"
+
+            # Unbilled AR %
+            output += f"Unbilled AR (%)             "
+            for kpis in quarters_list:
+                output += f"{kpis.get('unbilled_ar_pct', 0):.2f}%".ljust(17)
+            output += "\n"
+
+            # Denial vs Resolution
+            output += f"Denial vs Resolution (%)    "
+            for kpis in quarters_list:
+                output += f"{kpis.get('denial_resolution_rate_pct', 0):.2f}%".ljust(17)
+            output += "\n"
+
+            output += "\n"
+
+        output += "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+        output += f"Generated: {report['generated_at']}\n"
+
+        return output.strip()
 
     def format_report_as_text(self, report: Dict[str, Any]) -> str:
         """

@@ -29,17 +29,17 @@ class WeeklyReportTool:
 
     def generate_report(self, company_name: str = "Company", table_name: Optional[str] = None) -> str:
         """
-        Generate a weekly KPI report from the data.
+        Generate weekly, quarterly, and yearly KPI reports from the data.
 
         Args:
             company_name: Name of the company for the report header
             table_name: Specific table to query (if None, uses first available table)
 
         Returns:
-            Formatted weekly report as text
+            Formatted weekly, quarterly, and yearly reports as text (combined)
         """
         try:
-            logger.info(f"Generating weekly report for {company_name}...")
+            logger.info(f"Generating weekly and quarterly reports for {company_name}...")
 
             # Get all available tables
             tables = self.catalog.list_tables()
@@ -70,35 +70,74 @@ class WeeklyReportTool:
             # Initialize KPI calculator
             calculator = KPICalculator(df)
 
-            # Generate report
-            report = calculator.generate_weekly_report(company_name=company_name)
+            # Generate weekly report
+            weekly_report = calculator.generate_weekly_report(company_name=company_name)
+            formatted_weekly = calculator.format_report_as_text(weekly_report)
 
-            # Format as text
-            formatted_report = calculator.format_report_as_text(report)
+            # Generate quarterly report
+            quarterly_report = calculator.generate_quarterly_report(company_name=company_name)
+            formatted_quarterly = calculator.format_quarterly_report_as_text(quarterly_report)
 
-            logger.info(f"Successfully generated weekly report for {company_name}")
-            return formatted_report
+            # Generate yearly report
+            yearly_report = calculator.generate_yearly_report(company_name=company_name)
+            formatted_yearly = calculator.format_yearly_report_as_text(yearly_report)
+
+            # Generate weekly breakdown (for current month)
+            weekly_breakdown = calculator.generate_weekly_breakdown_report(company_name=company_name)
+            formatted_weekly_breakdown = calculator.format_weekly_breakdown_as_text(weekly_breakdown)
+
+            # Combine all four reports
+            combined_report = f"""
+{formatted_weekly}
+
+
+═════════════════════════════════════════════════════════════════
+
+
+{formatted_quarterly}
+
+
+═════════════════════════════════════════════════════════════════
+
+
+{formatted_yearly}
+
+
+═════════════════════════════════════════════════════════════════
+
+
+{formatted_weekly_breakdown}
+"""
+
+            logger.info(f"Successfully generated all reports for {company_name}")
+            return combined_report.strip()
 
         except Exception as e:
-            logger.error(f"Error generating weekly report: {e}", exc_info=True)
-            return f"❌ Error generating weekly report: {str(e)}"
+            logger.error(f"Error generating reports: {e}", exc_info=True)
+            return f"❌ Error generating reports: {str(e)}"
 
     def get_tool_description(self) -> str:
         """Get the tool description for LangGraph."""
-        return """Generate a weekly KPI report with 10 key metrics.
+        return """Generate weekly, quarterly, and yearly KPI reports with comprehensive metrics.
 
         Use this tool when the user asks for:
         - Weekly report
+        - Quarterly report
+        - Yearly report
+        - Year over Year report
         - KPI report
         - Performance metrics
         - Weekly summary
+        - Quarterly summary
         - Commands like "/weeklyreport --{company_name}"
 
         Parameters:
         - company_name: Name of the company (default: "Company")
         - table_name: Optional specific table name (default: first table)
 
-        Returns a formatted report with:
+        Returns FOUR formatted reports:
+
+        SLIDE 1 - WEEKLY REPORT:
         1. Visits
         2. Charges
         3. Charges Submitted (%)
@@ -109,6 +148,36 @@ class WeeklyReportTool:
         8. A/R (31-60 Days)
         9. A/R (60+ Days)
         10. Denial vs Resolution (%)
+
+        SLIDE 2 - QUARTERLY REPORT (by Year and Quarter):
+        1. Visits
+        2. Charges
+        3. Charges Submitted (%)
+        4. Payments
+        5. Gross Collection Rate (%)
+        6. Net Collection Rate (%)
+        7. Days in AR (DAR)
+        8. Billed AR
+        9. Billed AR %
+        10. Unbilled AR
+        11. Unbilled AR %
+        12. Denial vs Resolution (%)
+
+        SLIDE 3 - YEAR OVER YEAR REPORT:
+        1. Visits
+        2. Charges
+        3. Charges Submitted (%)
+        4. Payments
+        5. Gross Collection Rate (%)
+        6. Net Collection Rate (%)
+        7. Days in AR (DAR)
+        8. Billed AR
+        9. Unbilled AR
+        10. Denial vs Resolution (%)
+
+        SLIDE 4 - WEEKLY BREAKDOWN (Current Month):
+        1. Weekly Collections by Week
+        2. Weekly Visits by Week
         """
 
 

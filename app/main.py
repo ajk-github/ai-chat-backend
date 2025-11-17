@@ -446,6 +446,20 @@ async def chat(request: Request, req: ChatRequest) -> Dict[str, Any]:
         except Exception as fb_err:
             logging.getLogger(__name__).error(f"Firebase user message write failed for chat {req.chat_id}: {fb_err}")
 
+        # Retrieve chat history from Firestore
+        chat_history = []
+        try:
+            messages = await asyncio.to_thread(fb.get_chat_messages, req.chat_id)
+            # Format for agent: only include user and assistant messages (exclude system)
+            chat_history = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in messages
+                if msg["role"] in ["user", "assistant"]
+            ]
+        except Exception as fb_err:
+            logging.getLogger(__name__).warning(f"Failed to retrieve chat history: {fb_err}")
+            # Continue with empty history
+
         catalog = manager.get_chat_catalog(req.chat_id)
         processed_dir = get_processed_dir(user_id, req.chat_id)
         openai_api_key = os.getenv("OPENAI_API_KEY", "")
@@ -458,7 +472,7 @@ async def chat(request: Request, req: ChatRequest) -> Dict[str, Any]:
             schema_profiles_dir=processed_dir,
         )
 
-        result = await asyncio.to_thread(agent.ask, req.message, [])
+        result = await asyncio.to_thread(agent.ask, req.message, chat_history)
 
         # Persist assistant response to Firestore
         try:
