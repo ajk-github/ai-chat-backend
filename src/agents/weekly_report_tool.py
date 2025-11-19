@@ -125,8 +125,21 @@ class WeeklyReportTool:
             except Exception as e:
                 formatted_denial_categories = f"❌ Error generating denial categories: {str(e)}"
 
-            # Combine all eight reports
+            # Generate billing progress report
+            try:
+                billing_progress = calculator.generate_billing_progress_report(company_name=company_name)
+                formatted_billing_progress = calculator.format_billing_progress_as_text(billing_progress)
+            except Exception as e:
+                formatted_billing_progress = f"❌ Error generating billing progress: {str(e)}"
+
+            # Combine all reports in slide order (Slide 2-11, skipping Slide 10)
             combined_report = f"""
+{formatted_billing_progress}
+
+
+═════════════════════════════════════════════════════════════════
+
+
 {formatted_weekly}
 
 
@@ -198,7 +211,7 @@ class WeeklyReportTool:
         - company_name: Name of the company (default: "Company")
         - table_name: Optional specific table name (default: first table)
 
-        Returns EIGHT formatted reports:
+        Returns NINE formatted reports:
 
         SLIDE 1 - WEEKLY REPORT:
         1. Visits
@@ -264,6 +277,14 @@ class WeeklyReportTool:
         - Visit Count and Expected Payment per state
         - Total row for each state
         - For the last completed month
+
+        SLIDE 9 - BILLING PROGRESS (Current Month):
+        - Charges
+        - Encounters
+        - Insurance Payments Posted
+        - Patient Payments Posted
+        - A/R Claims processed
+        - Authorization denials / Pending claims
         """
 
 

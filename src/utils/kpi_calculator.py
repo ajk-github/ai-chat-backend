@@ -76,14 +76,15 @@ class KPICalculator:
         """
         Calculate total charges.
 
-        Formula: ∑ Charges
+        Formula: ∑ Charges (excluding negative values)
         """
         # Updated to match actual data column names
         charge_columns = ['charge', 'charges', 'total_charges', 'billed_amount', 'charge_amount']
 
         for col in charge_columns:
             if col in self.df.columns:
-                return float(self.df[col].sum())
+                # Exclude negative values and sum only positive charges
+                return float(self.df[self.df[col] > 0][col].sum())
 
         logger.warning("No charges column found.")
         return 0.0
@@ -117,12 +118,13 @@ class KPICalculator:
         # If we have both status and charges, calculate based on status
         if status_col and charge_col:
             try:
-                # Calculate claimed charges (status = 'Claim Created')
+                # Calculate claimed charges (status = 'Claim Created') - exclude negative values
                 claimed_mask = self.df[status_col].astype(str).str.lower().str.contains('claim created|submitted|billed', na=False)
-                claimed_charges = self.df.loc[claimed_mask, charge_col].sum()
+                positive_mask = self.df[charge_col] > 0
+                claimed_charges = self.df.loc[claimed_mask & positive_mask, charge_col].sum()
 
-                # Calculate total charges (all records, or exclude certain statuses)
-                total_charges = self.df[charge_col].sum()
+                # Calculate total charges (all records, excluding negative values)
+                total_charges = self.df.loc[positive_mask, charge_col].sum()
 
                 return self._safe_divide(claimed_charges, total_charges, 0.0) * 100
             except Exception as e:
@@ -221,7 +223,8 @@ class KPICalculator:
         for col in charge_columns:
             if col in df_filtered.columns:
                 try:
-                    return float(df_filtered[col].sum())
+                    # Exclude negative values and sum only positive charges
+                    return float(df_filtered[df_filtered[col] > 0][col].sum())
                 except:
                     pass
 
@@ -248,7 +251,9 @@ class KPICalculator:
             try:
                 df_filtered[unit_col] = pd.to_numeric(df_filtered[unit_col], errors='coerce').fillna(0)
                 df_filtered[amount_col] = pd.to_numeric(df_filtered[amount_col], errors='coerce').fillna(0)
-                total = (df_filtered[unit_col] * df_filtered[amount_col]).sum()
+                calculated_charges = df_filtered[unit_col] * df_filtered[amount_col]
+                # Exclude negative values and sum only positive charges
+                total = calculated_charges[calculated_charges > 0].sum()
                 return float(total)
             except Exception as e:
                 logger.warning(f"Error calculating charges from unit × amount: {e}")
@@ -933,7 +938,7 @@ class KPICalculator:
         sorted_weeks = sorted(weeks.items(), key=lambda x: x[1]['week'])
 
         # Format output as markdown tables
-        output = f"""## {company.upper()} - WEEKLY BREAKDOWN ({month_name} {year})
+        output = f"""## SLIDE 6: {company.upper()} - WEEKLY BREAKDOWN ({month_name} {year})
 
 ### Weekly Collections
 
@@ -1091,9 +1096,9 @@ class KPICalculator:
                         collections_dc = df_dc['total_payment'].sum()
                         print(f"DEBUG: Collections (date created): ${collections_dc:,.2f}")
 
-                    # Charges: Sum charge column
+                    # Charges: Sum charge column (excluding negative values)
                     if 'charge' in df_dc.columns:
-                        charges_dc = df_dc['charge'].sum()
+                        charges_dc = df_dc[df_dc['charge'] > 0]['charge'].sum()
                         print(f"DEBUG: Charges (date created): ${charges_dc:,.2f}")
 
                     # Visits: Count all rows (including null visit_status for testing)
@@ -1150,7 +1155,7 @@ class KPICalculator:
             return f"❌ No weekly comparison data available."
 
         # Format output as markdown table
-        output = f"""## {company.upper()} - WEEKLY COMPARISON ({week_start} - {week_end})
+        output = f"""## SLIDE 7: {company.upper()} - CLIENT SUMMARY WEEKLY ({week_start} - {week_end})
 
 | Metric | Based on Date of Service | Based on Date Created |
 |--------|--------------------------|----------------------|
@@ -1227,9 +1232,9 @@ class KPICalculator:
                 if 'total_payment' in df_dos.columns:
                     collections_dos = float(df_dos['total_payment'].sum())
 
-                # Charges
+                # Charges (excluding negative values)
                 if 'charge' in df_dos.columns:
-                    charges_dos = float(df_dos['charge'].sum())
+                    charges_dos = float(df_dos[df_dos['charge'] > 0]['charge'].sum())
 
                 # Visits
                 visits_dos = len(df_dos)
@@ -1255,9 +1260,9 @@ class KPICalculator:
                     if 'total_payment' in df_dc.columns:
                         collections_dc = float(df_dc['total_payment'].sum())
 
-                    # Charges
+                    # Charges (excluding negative values)
                     if 'charge' in df_dc.columns:
-                        charges_dc = float(df_dc['charge'].sum())
+                        charges_dc = float(df_dc[df_dc['charge'] > 0]['charge'].sum())
 
                     # Visits
                     visits_dc = len(df_dc)
@@ -1307,7 +1312,7 @@ class KPICalculator:
             return f"❌ No month-to-date comparison data available."
 
         # Format output as markdown table
-        output = f"""## {company.upper()} - MONTH TO DATE COMPARISON ({month_label})
+        output = f"""## SLIDE 8: {company.upper()} - CLIENT SUMMARY MONTH TO DATE ({month_label})
 
 | Metric | Based on Date of Service | Based on Date Created |
 |--------|--------------------------|----------------------|
@@ -1480,7 +1485,7 @@ class KPICalculator:
             header += f" {year} |"
             separator += "------|"
 
-        output = f"""## {company.upper()} - YEAR OVER YEAR KPI REPORT
+        output = f"""## SLIDE 5: {company.upper()} - KPI METRICS YEAR OVER YEAR
 
 {header}
 {separator}
@@ -1680,7 +1685,7 @@ class KPICalculator:
         kpis = latest_quarter_data["kpis"]
 
         # Format output - show only latest quarter
-        output = f"""## {company.upper()} - QUARTERLY KPI REPORT (Q{quarter} {year})
+        output = f"""## SLIDE 4: {company.upper()} - KPI METRICS QUARTERLY (Q{quarter} {year})
 
 | Type | Value |
 |------|-------|
@@ -1837,7 +1842,7 @@ class KPICalculator:
         kpis = report["kpis"]
         company = report["company"]
 
-        output = f"""## {company.upper()} - WEEKLY KPI REPORT
+        output = f"""## SLIDE 3: {company.upper()} - KPI METRICS WEEKLY
 
 | Type | Value |
 |------|-------|
@@ -2049,7 +2054,7 @@ class KPICalculator:
         header += " Grand Total |"
         separator += "-------------|"
 
-        output = f"""## {company.upper()} - UNBILLED STATUS REPORT
+        output = f"""## SLIDE 9: {company.upper()} - UNBILLED STATUS
 
 {header}
 {separator}
@@ -2291,7 +2296,7 @@ class KPICalculator:
             header += f" {state} Count | {state} Expected |"
             separator += "------|------|"
 
-        output = f"""## {company.upper()} - TOP 15 DENIAL CATEGORIES (Month: {month_label})
+        output = f"""## SLIDE 11: {company.upper()} - TOP 15 DENIAL CATEGORIES ({month_label})
 
 {header}
 {separator}
@@ -2317,5 +2322,196 @@ class KPICalculator:
         output += total_row + "\n"
 
         output += f"\n*Generated: {report['generated_at']}*\n"
+
+        return output.strip()
+
+    def generate_billing_progress_report(self, company_name: str = "Company") -> Dict[str, Any]:
+        """
+        Generate Billing Progress report for the current month.
+
+        Shows:
+        - Charges
+        - Encounters
+        - Insurance Payments Posted
+        - Patient Payments Posted
+        - A/R Claims processed
+        - Authorization denials / Pending claims
+        """
+        logger.info(f"Generating billing progress report for {company_name}...")
+
+        # Find date column
+        date_col = None
+        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date', 'transaction_date']
+        for col in date_columns:
+            if col in self.df.columns:
+                date_col = col
+                break
+
+        if date_col is None:
+            logger.warning("No date column found. Cannot generate billing progress report.")
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "error": "No date field found in data.",
+                "billing_progress": {}
+            }
+
+        try:
+            # Parse dates and filter to current month
+            df_copy = self.df.copy()
+            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+            df_copy = df_copy[df_copy[date_col].notna()]
+
+            if df_copy.empty:
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No valid dates found in data.",
+                    "billing_progress": {}
+                }
+
+            # Get current month range (1st of month to latest date)
+            latest_date = df_copy[date_col].max()
+            first_of_month = latest_date.replace(day=1)
+            month_label = latest_date.strftime('%B %Y')
+
+            # Filter to current month
+            df_month = df_copy[
+                (df_copy[date_col] >= first_of_month) &
+                (df_copy[date_col] <= latest_date)
+            ]
+
+            if df_month.empty:
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "month_label": month_label,
+                    "error": f"No data found for {month_label}.",
+                    "billing_progress": {}
+                }
+
+            # Calculate Charges (excluding negative values)
+            charges = 0.0
+            charge_columns = ['charge', 'charges', 'total_charges', 'billed_amount']
+            for col in charge_columns:
+                if col in df_month.columns:
+                    charges = float(df_month[df_month[col] > 0][col].sum())
+                    break
+
+            # Calculate Encounters (total visits)
+            encounters = len(df_month)
+
+            # Calculate Insurance Payments Posted (sum of primary, secondary, tertiary payments)
+            insurance_payments = 0.0
+
+            # Create a mapping of normalized column names to actual column names
+            col_map = {col.lower().replace(' ', '_'): col for col in df_month.columns}
+
+            # Sum primary, secondary, tertiary payments
+            if 'primary_payment' in col_map:
+                insurance_payments += float(df_month[col_map['primary_payment']].sum())
+            if 'secondary_payment' in col_map:
+                insurance_payments += float(df_month[col_map['secondary_payment']].sum())
+            if 'tertiary_payment' in col_map:
+                insurance_payments += float(df_month[col_map['tertiary_payment']].sum())
+
+            # Calculate Patient Payments Posted
+            patient_payments = 0.0
+            if 'patient_payment' in col_map:
+                patient_payments = float(df_month[col_map['patient_payment']].sum())
+
+            # Calculate A/R Claims processed (claims with Claim Status indicating processed/sent)
+            ar_claims_processed = 0
+            claim_status_col = col_map.get('claim_status')
+            if claim_status_col and claim_status_col in df_month.columns:
+                # Processed statuses based on actual data
+                claim_status_lower = df_month[claim_status_col].astype(str).str.lower().str.strip()
+                processed_mask = (
+                    claim_status_lower.str.contains('completed', na=False) |
+                    claim_status_lower.str.contains('payment received', na=False) |
+                    claim_status_lower.str.contains('sent', na=False) |
+                    claim_status_lower.str.contains('transmitted', na=False) |
+                    claim_status_lower.str.contains('paid', na=False)
+                )
+                ar_claims_processed = int(processed_mask.sum())
+
+            # Calculate Authorization denials / Pending claims
+            auth_denials_pending = 0
+            if claim_status_col and claim_status_col in df_month.columns:
+                # Denial and pending statuses based on actual data
+                claim_status_lower = df_month[claim_status_col].astype(str).str.lower().str.strip()
+                pending_denial_mask = (
+                    claim_status_lower.str.contains('denial', na=False) |
+                    claim_status_lower.str.contains('pending', na=False) |
+                    claim_status_lower.str.contains('authorization', na=False) |
+                    claim_status_lower.str.contains('missing auth', na=False)
+                )
+                auth_denials_pending = int(pending_denial_mask.sum())
+
+            logger.info(f"Billing progress report generated for {month_label}")
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "month_label": month_label,
+                "billing_progress": {
+                    "charges": charges,
+                    "encounters": encounters,
+                    "insurance_payments": insurance_payments,
+                    "patient_payments": patient_payments,
+                    "ar_claims_processed": ar_claims_processed,
+                    "auth_denials_pending": auth_denials_pending
+                }
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating billing progress report: {e}", exc_info=True)
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "error": f"Error generating billing progress report: {str(e)}",
+                "billing_progress": {}
+            }
+
+    def format_billing_progress_as_text(self, report: Dict[str, Any]) -> str:
+        """
+        Format the billing progress report as markdown table.
+
+        Args:
+            report: Report dictionary from generate_billing_progress_report()
+
+        Returns:
+            Formatted string with billing progress metrics
+        """
+        company = report.get('company', 'Company')
+        month_label = report.get('month_label', 'Current Month')
+
+        if 'error' in report:
+            return f"## {company.upper()} - BILLING PROGRESS ({month_label})\n\nError: {report['error']}"
+
+        progress = report.get('billing_progress', {})
+
+        if not progress:
+            return f"## {company.upper()} - BILLING PROGRESS ({month_label})\n\nNo billing progress data available."
+
+        charges = progress.get('charges', 0)
+        encounters = progress.get('encounters', 0)
+        insurance_payments = progress.get('insurance_payments', 0)
+        patient_payments = progress.get('patient_payments', 0)
+        ar_claims_processed = progress.get('ar_claims_processed', 0)
+        auth_denials_pending = progress.get('auth_denials_pending', 0)
+
+        output = f"""## SLIDE 2: {company.upper()} - BILLING PROGRESS ({month_label})
+
+| Metric | Value |
+|--------|-------|
+| Charges | ${charges:,.0f} |
+| Encounters | {encounters:,} |
+| Insurance Payments Posted | ${insurance_payments:,.0f} |
+| Patient Payments Posted | ${patient_payments:,.0f} |
+| A/R Claims processed | {ar_claims_processed:,} |
+| Authorization denials/ Pending claims | {auth_denials_pending:,} |
+
+*Generated: {report['generated_at']}*
+"""
 
         return output.strip()
