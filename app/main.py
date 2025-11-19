@@ -1,7 +1,7 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-from typing import Dict, Any
+from typing import Dict, Any, Optional, List
 from uuid import uuid4, UUID
 import os
 import tempfile
@@ -63,7 +63,10 @@ if str(SRC_DIR) not in sys.path:
 
 from data_processing.chat_data_manager import ChatDataManager
 from agents.data_query_agent import DataQueryAgent
+from data_processing.mysql_catalog import MySQLCatalog
+from agents.database_query_agent import DatabaseQueryAgent
 from .firebase_service import FirebaseService
+from .database_manager import get_mysql_catalog_for_database, get_database_manager
 
 
 def sanitize_user_id(user_id: str) -> str:
@@ -170,6 +173,31 @@ class ChatRequest(BaseModel):
     def validate_chat_id(cls, v: str) -> str:
         """Validate chat_id is a valid UUID format."""
         return sanitize_chat_id(v)
+
+
+class DatabaseChatRequest(BaseModel):
+    """Request model for database chat endpoint."""
+    chat_id: str
+    message: str
+    user_id: str
+    database: str  # Database identifier (e.g., "TELOS", "CLIENT1")
+    
+    @field_validator('chat_id')
+    @classmethod
+    def validate_chat_id(cls, v: str) -> str:
+        """Validate chat_id is a valid UUID format."""
+        return sanitize_chat_id(v)
+    
+    @field_validator('database')
+    @classmethod
+    def validate_database(cls, v: str) -> str:
+        """Validate database identifier."""
+        if not v or not v.strip():
+            raise ValueError("Database identifier cannot be empty")
+        # Allow alphanumeric, hyphens, underscores
+        if not all(c.isalnum() or c in '-_' for c in v):
+            raise ValueError("Database identifier can only contain alphanumeric characters, hyphens, and underscores")
+        return v.strip().upper()
 
 
 async def verify_chat_ownership(chat_id: str, user_id: str) -> bool:
@@ -537,9 +565,276 @@ async def delete_chat(
             logging.getLogger(__name__).warning(f"Error cleaning up manager resources: {cleanup_err}")
 
 
+# Global MySQL catalog instance (singleton)
+_mysql_catalog: Optional[MySQLCatalog] = None
+
+
+def get_mysql_catalog() -> MySQLCatalog:
+    """
+    Get or create the global MySQL catalog instance.
+    
+    Returns:
+        MySQLCatalog instance
+    """
+    global _mysql_catalog
+    
+    if _mysql_catalog is None:
+        # Get database credentials from environment (REQUIRED - no defaults for security)
+        db_host = os.getenv("MYSQL_HOST")
+        db_user = os.getenv("MYSQL_USER")
+        db_password = os.getenv("MYSQL_PASSWORD")
+        db_name = os.getenv("MYSQL_DATABASE")
+        db_port = int(os.getenv("MYSQL_PORT", "3306"))  # Port can have default
+        
+        # Validate required credentials
+        if not all([db_host, db_user, db_password, db_name]):
+            missing = [k for k, v in {
+                "MYSQL_HOST": db_host,
+                "MYSQL_USER": db_user,
+                "MYSQL_PASSWORD": db_password,
+                "MYSQL_DATABASE": db_name
+            }.items() if not v]
+            raise ValueError(
+                f"Missing required MySQL environment variables: {', '.join(missing)}. "
+                "Please set them in your .env file or environment."
+            )
+        
+        _mysql_catalog = MySQLCatalog(
+            host=db_host,
+            user=db_user,
+            password=db_password,
+            database=db_name,
+            port=db_port,
+            pool_size=5,
+            max_overflow=10,
+        )
+        logging.getLogger(__name__).info(f"MySQL catalog initialized for {db_host}/{db_name}")
+    
+    return _mysql_catalog
+
+
+class CreateDatabaseChatRequest(BaseModel):
+    """Request model for creating a new database chat session."""
+    user_id: str
+
+
+@app.post("/api/db/chat/create")
+@limiter.limit(RATE_LIMITS["chat_per_hour"])
+async def create_db_chat(request: Request, req: CreateDatabaseChatRequest) -> Dict[str, Any]:
+    """
+    Create a new database chat session.
+    
+    This endpoint creates a new chat session in Firestore for database queries.
+    Returns the chat_id that should be used for subsequent /api/db/chat requests.
+    """
+    # Sanitize user_id
+    user_id = sanitize_user_id(req.user_id)
+    
+    # Generate new chat_id
+    chat_id = str(uuid4())
+    
+    try:
+        # Create chat session in Firestore
+        fb = FirebaseService()
+        await asyncio.to_thread(
+            fb.create_chat_session,
+            chat_id,
+            user_id,
+            "Database Query Chat",
+            "Database query chat session - ask questions about your database",
+            'database'  # Mark as database chat type
+        )
+        
+        return {
+            "chatId": chat_id,
+            "message": "Database chat session created successfully"
+        }
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Error creating database chat session: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to create database chat session")
+
+
+@app.post("/api/db/chat")
+@limiter.limit(RATE_LIMITS["chat_per_hour"])
+@limiter.limit(RATE_LIMITS["chat_per_day"])
+@limiter.limit(RATE_LIMITS["chat_burst"])
+async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
+    """
+    Chat endpoint for database queries (MySQL).
+    
+    This endpoint allows users to ask natural language questions about the database,
+    which are converted to SQL queries and executed against the MySQL database.
+    """
+    # Sanitize user_id
+    # chat_id is already validated by Pydantic validator
+    user_id = sanitize_user_id(req.user_id)
+    
+    # Verify chat ownership
+    if not await verify_chat_ownership(req.chat_id, user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Chat does not belong to user"
+        )
+    
+    try:
+        # First, persist the user's message to Firestore before processing
+        try:
+            fb = FirebaseService()
+            await asyncio.to_thread(
+                fb.add_message,
+                req.chat_id,
+                user_id,
+                'user',
+                req.message,
+            )
+        except Exception as fb_err:
+            logging.getLogger(__name__).error(f"Firebase user message write failed for chat {req.chat_id}: {fb_err}")
+        
+        # Retrieve chat history from Firestore
+        chat_history = []
+        try:
+            messages = await asyncio.to_thread(fb.get_chat_messages, req.chat_id)
+            # Format for agent: only include user and assistant messages (exclude system)
+            chat_history = [
+                {"role": msg["role"], "content": msg["content"]}
+                for msg in messages
+                if msg["role"] in ["user", "assistant"]
+            ]
+        except Exception as fb_err:
+            logging.getLogger(__name__).warning(f"Failed to retrieve chat history: {fb_err}")
+            # Continue with empty history
+        
+        # Get MySQL catalog for the specified database
+        try:
+            catalog = get_mysql_catalog_for_database(req.database)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Database configuration error: {str(e)}"
+            )
+        except Exception as e:
+            logging.getLogger(__name__).error(f"Error getting database catalog for '{req.database}': {e}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to connect to database '{req.database}'. Please check the database configuration."
+            )
+        
+        # Get OpenAI API key
+        openai_api_key = os.getenv("OPENAI_API_KEY", "")
+        if not openai_api_key:
+            raise HTTPException(status_code=500, detail="OPENAI_API_KEY not configured")
+        
+        # Create database query agent
+        agent = DatabaseQueryAgent(
+            mysql_catalog=catalog,
+            openai_api_key=openai_api_key,
+        )
+        
+        # Process the question with chat history
+        result = await agent.ask(
+            req.message,
+            chat_history
+        )
+        
+        # Persist assistant response to Firestore
+        try:
+            fb = FirebaseService()
+            await asyncio.to_thread(
+                fb.add_message,
+                req.chat_id,
+                user_id,
+                'assistant',
+                result.get("answer", ""),
+            )
+        except Exception as fb_err:
+            logging.getLogger(__name__).error(f"Firebase message write failed for chat {req.chat_id}: {fb_err}")
+        
+        return {
+            "response": result.get("answer", ""),
+            "sql_query": result.get("sql_query"),
+            "metadata": result.get("metadata", {}),
+            "success": result.get("success", False),
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        error_msg = str(e)
+        logging.getLogger(__name__).error(f"Error processing database chat request: {e}", exc_info=True)
+        import traceback
+        if os.getenv("DEBUG", "false").lower() == "true":
+            raise HTTPException(
+                status_code=500, 
+                detail=f"Failed to process database chat request: {error_msg}\n{traceback.format_exc()}"
+            )
+        raise HTTPException(status_code=500, detail=f"Failed to process database chat request: {error_msg}")
+
+
 @app.get("/health")
 async def health() -> Dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/chat/info/{chat_id}")
+async def get_chat_info(chat_id: str, user_id: str) -> Dict[str, Any]:
+    """
+    Get chat session information including chat type.
+    
+    This helps the frontend determine which endpoint to use:
+    - chatType: 'database' -> use /api/db/chat
+    - chatType: 'file' -> use /api/chat
+    """
+    # Sanitize inputs
+    user_id = sanitize_user_id(user_id)
+    chat_id = sanitize_chat_id(chat_id)
+    
+    # Verify ownership
+    if not await verify_chat_ownership(chat_id, user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Chat does not belong to user"
+        )
+    
+    try:
+        fb = FirebaseService()
+        chat = await asyncio.to_thread(fb.get_chat, chat_id)
+        
+        if not chat:
+            raise HTTPException(status_code=404, detail="Chat not found")
+        
+        # Return chat info with chatType (defaults to 'file' for backward compatibility)
+        return {
+            "chatId": chat.get("chatId", chat_id),
+            "userId": chat.get("userId", user_id),
+            "title": chat.get("title", ""),
+            "chatType": chat.get("chatType", "file"),  # Default to 'file' for old chats
+            "createdAt": chat.get("createdAt"),
+            "updatedAt": chat.get("updatedAt"),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Error getting chat info: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to get chat info")
+
+
+@app.get("/api/db/databases")
+async def list_databases() -> Dict[str, Any]:
+    """
+    List all available database configurations.
+    
+    Returns a list of database IDs that have complete configurations.
+    """
+    try:
+        manager = get_database_manager()
+        databases = manager.list_available_databases()
+        return {
+            "databases": databases,
+            "count": len(databases)
+        }
+    except Exception as e:
+        logging.getLogger(__name__).error(f"Error listing databases: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Failed to list databases")
 
 
 # Global cleanup function for graceful shutdown
@@ -547,8 +842,27 @@ def cleanup_on_shutdown():
     """Cleanup function called on application shutdown."""
     logger = logging.getLogger(__name__)
     logger.info("Application shutting down - performing cleanup...")
+    
+    # Close all database connection pools
+    try:
+        import asyncio
+        manager = get_database_manager()
+        # Try to close all pools (async operation)
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                # Can't use run_until_complete in a running loop
+                logger.warning("Cannot close database pools synchronously - event loop is running")
+            else:
+                loop.run_until_complete(manager.close_all())
+        except RuntimeError:
+            # No event loop - create one
+            asyncio.run(manager.close_all())
+        logger.info("All database connection pools closed")
+    except Exception as e:
+        logger.warning(f"Error closing database connection pools: {e}")
+    
     # Note: Individual ChatDataManager instances are cleaned up per-request
-    # This is a placeholder for any global cleanup needed in the future
     logger.info("Cleanup completed")
 
 

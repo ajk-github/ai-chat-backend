@@ -56,5 +56,5 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 
 For production (No Auto Reload):
 ```bash
-uvicorn app.main:app --host 0.0.0.0 --port 8000 --no-reload
+uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
