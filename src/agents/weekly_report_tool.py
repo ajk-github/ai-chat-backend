@@ -86,7 +86,46 @@ class WeeklyReportTool:
             weekly_breakdown = calculator.generate_weekly_breakdown_report(company_name=company_name)
             formatted_weekly_breakdown = calculator.format_weekly_breakdown_as_text(weekly_breakdown)
 
-            # Combine all four reports
+            print("DEBUG: Finished weekly breakdown, about to start weekly comparison...")
+
+            # Generate weekly comparison (latest week)
+            try:
+                print("\n" + "=" * 80)
+                print("DEBUG: STARTING WEEKLY COMPARISON REPORT GENERATION")
+                print("=" * 80)
+                weekly_comparison = calculator.generate_weekly_comparison_report(company_name=company_name)
+                print(f"DEBUG: Weekly comparison data: {weekly_comparison}")
+                formatted_weekly_comparison = calculator.format_weekly_comparison_as_text(weekly_comparison)
+                print("DEBUG: WEEKLY COMPARISON REPORT COMPLETED")
+                print("=" * 80 + "\n")
+            except Exception as e:
+                print(f"DEBUG ERROR in weekly comparison: {e}")
+                import traceback
+                traceback.print_exc()
+                formatted_weekly_comparison = f"❌ Error generating weekly comparison: {str(e)}"
+
+            # Generate month-to-date comparison report (right after weekly comparison)
+            try:
+                monthly_comparison = calculator.generate_monthly_comparison_report(company_name=company_name)
+                formatted_monthly_comparison = calculator.format_monthly_comparison_as_text(monthly_comparison)
+            except Exception as e:
+                formatted_monthly_comparison = f"❌ Error generating monthly comparison: {str(e)}"
+
+            # Generate unbilled status report
+            try:
+                unbilled_status = calculator.generate_unbilled_status_report(company_name=company_name)
+                formatted_unbilled_status = calculator.format_unbilled_status_as_text(unbilled_status)
+            except Exception as e:
+                formatted_unbilled_status = f"❌ Error generating unbilled status: {str(e)}"
+
+            # Generate denial categories report
+            try:
+                denial_categories = calculator.generate_denial_categories_report(company_name=company_name)
+                formatted_denial_categories = calculator.format_denial_categories_as_text(denial_categories)
+            except Exception as e:
+                formatted_denial_categories = f"❌ Error generating denial categories: {str(e)}"
+
+            # Combine all eight reports
             combined_report = f"""
 {formatted_weekly}
 
@@ -107,6 +146,30 @@ class WeeklyReportTool:
 
 
 {formatted_weekly_breakdown}
+
+
+═════════════════════════════════════════════════════════════════
+
+
+{formatted_weekly_comparison}
+
+
+═════════════════════════════════════════════════════════════════
+
+
+{formatted_monthly_comparison}
+
+
+═════════════════════════════════════════════════════════════════
+
+
+{formatted_unbilled_status}
+
+
+═════════════════════════════════════════════════════════════════
+
+
+{formatted_denial_categories}
 """
 
             logger.info(f"Successfully generated all reports for {company_name}")
@@ -135,7 +198,7 @@ class WeeklyReportTool:
         - company_name: Name of the company (default: "Company")
         - table_name: Optional specific table name (default: first table)
 
-        Returns FOUR formatted reports:
+        Returns EIGHT formatted reports:
 
         SLIDE 1 - WEEKLY REPORT:
         1. Visits
@@ -176,8 +239,31 @@ class WeeklyReportTool:
         10. Denial vs Resolution (%)
 
         SLIDE 4 - WEEKLY BREAKDOWN (Current Month):
-        1. Weekly Collections by Week
-        2. Weekly Visits by Week
+        1. Weekly Collections by Week (Cumulative)
+        2. Weekly Visits by Week (Cumulative)
+        3. Forecasted Expected Payments
+
+        SLIDE 5 - WEEKLY COMPARISON (Latest Past Week):
+        1. Collections: Based on Date of Service vs Based on Date Created
+        2. Charges: Based on Date of Service vs Based on Date Created
+        3. Visits: Based on Date of Service vs Based on Date Created
+
+        SLIDE 6 - MONTH TO DATE COMPARISON:
+        - Collections: Based on Date of Service vs Based on Date Created
+        - Charges: Based on Date of Service vs Based on Date Created
+        - Visits: Based on Date of Service vs Based on Date Created
+        - From 1st of current month to latest date in data
+
+        SLIDE 7 - UNBILLED STATUS:
+        - Visit counts by status (excluding Claim Created) for last completed week
+        - Statuses: Approved, On Hold, Alert, Pending Auth, Reviewed, etc.
+        - Grand Total per status
+
+        SLIDE 8 - TOP 15 DENIAL CATEGORIES:
+        - Top 15 denial descriptions by visit count
+        - Visit Count and Expected Payment per state
+        - Total row for each state
+        - For the last completed month
         """
 
 
