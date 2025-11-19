@@ -153,13 +153,24 @@ class SchemaProfiler:
 
     def _profile_numeric(self, series: pd.Series) -> Dict[str, Any]:
         """Profile numeric column."""
+        # Check if series has any non-null values to avoid numpy warnings
+        if series.dropna().empty:
+            return {
+                "data_category": "numeric",
+                "min": None,
+                "max": None,
+                "mean": None,
+                "median": None,
+                "std": None,
+            }
+
         return {
             "data_category": "numeric",
-            "min": float(series.min()) if pd.notna(series.min()) else None,
-            "max": float(series.max()) if pd.notna(series.max()) else None,
-            "mean": float(series.mean()) if pd.notna(series.mean()) else None,
-            "median": float(series.median()) if pd.notna(series.median()) else None,
-            "std": float(series.std()) if pd.notna(series.std()) else None,
+            "min": float(series.min()),
+            "max": float(series.max()),
+            "mean": float(series.mean()),
+            "median": float(series.median()),
+            "std": float(series.std()),
         }
 
     def _profile_datetime(self, series: pd.Series) -> Dict[str, Any]:
@@ -177,11 +188,20 @@ class SchemaProfiler:
         str_series = series.astype(str)
         lengths = str_series.str.len()
 
+        # Check if lengths has any non-null values to avoid numpy warnings
+        if lengths.dropna().empty:
+            return {
+                "data_category": "text",
+                "min_length": None,
+                "max_length": None,
+                "avg_length": None,
+            }
+
         return {
             "data_category": "text",
-            "min_length": int(lengths.min()) if pd.notna(lengths.min()) else None,
-            "max_length": int(lengths.max()) if pd.notna(lengths.max()) else None,
-            "avg_length": float(lengths.mean()) if pd.notna(lengths.mean()) else None,
+            "min_length": int(lengths.min()),
+            "max_length": int(lengths.max()),
+            "avg_length": float(lengths.mean()),
         }
 
     def _profile_boolean(self, series: pd.Series) -> Dict[str, Any]:
