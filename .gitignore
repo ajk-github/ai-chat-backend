@@ -78,3 +78,9 @@ data/
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Documentation (internal, not for version control)
+Formulas.md
+Formulas.txt
+REFACTORING_SUMMARY.md
+ARCHITECTURE.md

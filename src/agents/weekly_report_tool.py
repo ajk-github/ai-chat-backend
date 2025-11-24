@@ -1,6 +1,15 @@
 """
-Weekly Report Tool
-LangGraph tool for generating weekly KPI reports from uploaded data.
+Weekly Report Tool (DEPRECATED - USE telos_weekly_report_tool.py INSTEAD)
+
+This is the legacy weekly report tool. It has been superseded by the new modular architecture:
+
+- For Telos reports: Use src/agents/telos_weekly_report_tool.py (11 slides, company-specific)
+- For individual metrics: Use src/tools/kpi_metrics_tools.py (AI agent tools)
+- For calculation functions: See src/utils/kpi_calculations.py (pure functions)
+
+See ARCHITECTURE.md for the new structure and migration guide.
+
+This legacy tool remains for backward compatibility but may be removed in future versions.
 """
 # src/agents/weekly_report_tool.py
 

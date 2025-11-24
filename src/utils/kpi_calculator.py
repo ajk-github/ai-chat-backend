@@ -851,44 +851,90 @@ class KPICalculator:
                     "weeks": {}
                 }
 
+            # Calculate 3-month average for forecasting
+            # Get the date 3 months ago from the target month
+            first_of_target_month = datetime(year, month, 1)
+            three_months_ago = first_of_target_month - timedelta(days=90)
+
+            # Filter last 3 months of data for calculating averages
+            df_three_months = df_copy[
+                (df_copy[date_col] >= three_months_ago) &
+                (df_copy[date_col] < first_of_target_month)
+            ]
+
+            # Calculate number of days in the 3-month period
+            if not df_three_months.empty:
+                min_date = df_three_months[date_col].min()
+                max_date = df_three_months[date_col].max()
+                days_in_three_months = (max_date - min_date).days + 1
+            else:
+                days_in_three_months = 90  # Default to 90 days
+
+            # Calculate 3-month daily averages
+            total_visits_3m = len(df_three_months) if not df_three_months.empty else 0
+            avg_daily_visits = total_visits_3m / days_in_three_months if days_in_three_months > 0 else 0
+
+            # Collections: total payment (excluding negatives) in 3 months / days
+            if 'total_payment' in df_three_months.columns and not df_three_months.empty:
+                total_collections_3m = float(df_three_months[df_three_months['total_payment'] > 0]['total_payment'].sum())
+            else:
+                total_collections_3m = 0.0
+            avg_daily_collections = total_collections_3m / days_in_three_months if days_in_three_months > 0 else 0
+
             # Add week number (week of month)
             df_filtered['day_of_month'] = df_filtered[date_col].dt.day
             df_filtered['week_of_month'] = ((df_filtered['day_of_month'] - 1) // 7) + 1
 
-            # Group by week of month and calculate individual week metrics first
+            # Calculate actual days in each week of the target month
+            import calendar
+            last_day_of_month = calendar.monthrange(year, month)[1]
+
+            def get_days_in_week(week_num):
+                """Calculate actual number of days in a specific week of the month"""
+                start_day = (week_num - 1) * 7 + 1
+                end_day = min(week_num * 7, last_day_of_month)
+                return end_day - start_day + 1
+
+            # Group by week of month and calculate metrics for each week
             weekly_data = {}
             weeks_sorted = sorted(df_filtered['week_of_month'].unique())
 
-            # Calculate individual week metrics
-            week_metrics = {}
-            for week_num in weeks_sorted:
-                week_df = df_filtered[df_filtered['week_of_month'] == week_num]
-                week_calc = KPICalculator(week_df)
-
-                week_metrics[int(week_num)] = {
-                    "visits": week_calc.calculate_total_visits(),
-                    "collections": week_calc._calculate_filtered_payments(),  # Use filtered payments
-                    "expected": week_calc._calculate_expected_payments(),  # Use filtered expected payments
-                }
-
             # Calculate cumulative values
-            cumulative_visits = 0
-            cumulative_collections = 0
-            cumulative_expected = 0
+            cumulative_forecasted_visits = 0
+            cumulative_actual_visits = 0
+            cumulative_forecasted_collections = 0.0
+            cumulative_actual_collections = 0.0
 
             for week_num in weeks_sorted:
-                metrics = week_metrics[int(week_num)]
+                # Get actual number of days in this week
+                days_in_week = get_days_in_week(week_num)
 
-                # Add this week's values to cumulative totals
-                cumulative_visits += metrics["visits"]
-                cumulative_collections += metrics["collections"]
-                cumulative_expected += metrics["expected"]
+                # Calculate forecast for this week based on actual days
+                forecasted_visits_per_week = avg_daily_visits * days_in_week
+                forecasted_collections_per_week = avg_daily_collections * days_in_week
+                week_df = df_filtered[df_filtered['week_of_month'] == week_num]
+
+                # Actual visits for this week
+                actual_visits = len(week_df)
+
+                # Actual collections for this week (excluding negative values)
+                if 'total_payment' in week_df.columns:
+                    actual_collections = float(week_df[week_df['total_payment'] > 0]['total_payment'].sum())
+                else:
+                    actual_collections = 0.0
+
+                # Add to cumulative totals
+                cumulative_forecasted_visits += round(forecasted_visits_per_week)
+                cumulative_actual_visits += actual_visits
+                cumulative_forecasted_collections += forecasted_collections_per_week
+                cumulative_actual_collections += actual_collections
 
                 weekly_data[f"week_{int(week_num)}"] = {
                     "week": int(week_num),
-                    "visits": cumulative_visits,  # Cumulative
-                    "collections": cumulative_collections,  # Cumulative
-                    "forecasted": cumulative_expected,  # Cumulative expected payments
+                    "forecasted_visits": cumulative_forecasted_visits,
+                    "actual_visits": cumulative_actual_visits,
+                    "forecasted_collections": cumulative_forecasted_collections,
+                    "actual_collections": cumulative_actual_collections,
                 }
 
             logger.info(f"Weekly breakdown report generated for {year}-{month:02d}")
@@ -942,27 +988,26 @@ class KPICalculator:
 
 ### Weekly Collections
 
-| Forecasted | Week | Week Actual |
-|------------|------|-------------|
+| Week | Forecasted | Actual |
+|------|------------|--------|
 """
         for week_key, week_data in sorted_weeks:
             week_num = week_data['week']
-            forecasted = week_data.get('forecasted', 0)
-            collections = week_data['collections']
-            output += f"| ${forecasted:,.2f} | Week {week_num} | ${collections:,.2f} |\n"
+            forecasted_collections = week_data.get('forecasted_collections', 0)
+            actual_collections = week_data.get('actual_collections', 0)
+            output += f"| Week {week_num} | ${forecasted_collections:,.2f} | ${actual_collections:,.2f} |\n"
 
         output += f"""
-### Weekly Visits Breakdown
+### Weekly Visits
 
-| Week | Visits (Cumulative) |
-|------|---------------------|
+| Week | Forecasted | Actual |
+|------|------------|--------|
 """
         for week_key, week_data in sorted_weeks:
             week_num = week_data['week']
-            visits = week_data['visits']
-            output += f"| Week {week_num} | {visits:,} |\n"
-
-        output += f"\n*Generated: {report['generated_at']}*\n"
+            forecasted_visits = week_data.get('forecasted_visits', 0)
+            actual_visits = week_data.get('actual_visits', 0)
+            output += f"| Week {week_num} | {forecasted_visits:,} | {actual_visits:,} |\n"
 
         return output.strip()
 
@@ -1033,79 +1078,18 @@ class KPICalculator:
                 (df_copy[date_col] <= week_end)
             ]
 
-            # Calculate metrics based on Date of Service
+            # Calculate metrics based on Date of Service (using visit_date)
             dos_calc = KPICalculator(df_dos) if not df_dos.empty else None
 
             collections_dos = dos_calc._calculate_filtered_payments() if dos_calc else 0.0
             charges_dos = dos_calc._calculate_filtered_charges() if dos_calc else 0.0
             visits_dos = dos_calc.calculate_total_visits() if dos_calc else 0
 
-            # Now calculate based on Date Created
-            # Based on your actual data columns:
-            # - Transaction Date: for payments
-            # - Visit Date: for charges and visits (no separate created date in your data)
-
-            # Find payment transaction date column
-            # Prioritize primary_payment_date over transaction_date
-            payment_created_col = None
-            payment_created_columns = ['primary_payment_date', 'payment_date', 'transaction_date']
-            for col in payment_created_columns:
-                if col in df_copy.columns:
-                    payment_created_col = col
-                    print(f"DEBUG: Using '{col}' for payment date created")
-                    break
-
-            # For charges and visits: Since there's no separate created date in your data,
-            # "Based on Date Created" will be the same as "Based on Date of Service"
-            # This means both columns will show the same value
-            charge_created_col = None  # No separate charge created date in data
-            visit_created_col = None  # No separate visit created date in data
-
-            # Calculate metrics based on Date Created
-            collections_dc = 0.0
-            charges_dc = charges_dos  # Same as Date of Service (no created date in data)
-            visits_dc = visits_dos  # Same as Date of Service (no created date in data)
-
-            # Calculate metrics based on Date Created (using transaction_date)
-            collections_dc = 0.0
-            charges_dc = 0.0
-            visits_dc = 0
-            df_temp = df_copy.copy()
-
-            # Use transaction_date for date created
-            if 'transaction_date' in df_temp.columns:
-                print(f"DEBUG: Using 'transaction_date' for date created")
-                df_temp['transaction_date'] = pd.to_datetime(df_temp['transaction_date'], errors='coerce')
-
-                # Log date range info
-                valid_dates = df_temp['transaction_date'].notna().sum()
-                print(f"DEBUG: Valid dates in 'transaction_date': {valid_dates}/{len(df_temp)}")
-
-                # Filter rows where transaction_date is in the week
-                df_dc = df_temp[
-                    (df_temp['transaction_date'].notna()) &
-                    (df_temp['transaction_date'] >= week_start) &
-                    (df_temp['transaction_date'] <= week_end)
-                ]
-
-                print(f"DEBUG: Rows matching week {week_start.date()} to {week_end.date()}: {len(df_dc)}")
-
-                if not df_dc.empty:
-                    # Collections: Sum total_payment
-                    if 'total_payment' in df_dc.columns:
-                        collections_dc = df_dc['total_payment'].sum()
-                        print(f"DEBUG: Collections (date created): ${collections_dc:,.2f}")
-
-                    # Charges: Sum charge column (excluding negative values)
-                    if 'charge' in df_dc.columns:
-                        charges_dc = df_dc[df_dc['charge'] > 0]['charge'].sum()
-                        print(f"DEBUG: Charges (date created): ${charges_dc:,.2f}")
-
-                    # Visits: Count all rows (including null visit_status for testing)
-                    visits_dc = len(df_dc)
-                    print(f"DEBUG: Visits (date created): {visits_dc:,}")
-            else:
-                print("DEBUG: No transaction_date column found")
+            # Calculate metrics based on Date Created (also using visit_date)
+            # Note: Both columns now use visit_date as requested
+            collections_dc = collections_dos
+            charges_dc = charges_dos
+            visits_dc = visits_dos
 
             logger.info(f"Weekly comparison report generated for {week_start.date()} to {week_end.date()}")
             return {
@@ -1154,29 +1138,29 @@ class KPICalculator:
         if not comparison:
             return f"❌ No weekly comparison data available."
 
-        # Format output as markdown table
+        # Format output as markdown table (single column using visit_date)
         output = f"""## SLIDE 7: {company.upper()} - CLIENT SUMMARY WEEKLY ({week_start} - {week_end})
 
-| Metric | Based on Date of Service | Based on Date Created |
-|--------|--------------------------|----------------------|
-| Collections | ${comparison['collections_dos']:,.2f} | ${comparison['collections_dc']:,.2f} |
-| Charges | ${comparison['charges_dos']:,.2f} | ${comparison['charges_dc']:,.2f} |
-| Visits | {comparison['visits_dos']:,} | {comparison['visits_dc']:,} |
-
-*Generated: {report['generated_at']}*
+| Metric | Amount |
+|--------|--------|
+| Collections | ${comparison['collections_dc']:,.2f} |
+| Charges | ${comparison['charges_dc']:,.2f} |
+| Visits | {comparison['visits_dc']:,} |
 """
         return output.strip()
 
     def generate_monthly_comparison_report(self, company_name: str = "Company") -> Dict[str, Any]:
         """
-        Generate a month-to-date comparison report showing metrics based on Date of Service vs Date Created.
-        Shows data from 1st of current month to latest date in data.
+        Generate a month-to-date comparison report showing metrics for current month plus
+        last 3 months with the same day range. Both columns use visit_date.
+
+        Example: If latest date is Nov 16, show Nov 1-16, Oct 1-16, Sep 1-16, Aug 1-16
 
         Args:
             company_name: Name of the company for the report
 
         Returns:
-            Dictionary containing month-to-date comparison metrics
+            Dictionary containing month-to-date comparison metrics for 4 months
         """
         logger.info(f"Generating month-to-date comparison report for {company_name}...")
 
@@ -1209,76 +1193,61 @@ class KPICalculator:
                     "monthly_comparison": {}
                 }
 
-            # Month to Date: from 1st of current month to latest date
+            # Get latest date and calculate day range
             latest_date = df_copy[date_col].max()
-            first_of_month = latest_date.replace(day=1)
+            day_of_month = latest_date.day
 
-            month_label = f"{first_of_month.strftime('%b %d')} - {latest_date.strftime('%b %d, %Y')}"
-            logger.info(f"Month to date: {month_label}")
+            logger.info(f"Latest date: {latest_date}, using day range 1-{day_of_month}")
 
-            # Filter for month to date based on Date of Service (visit_date)
-            df_dos = df_copy[
-                (df_copy[date_col] >= first_of_month) &
-                (df_copy[date_col] <= latest_date)
-            ]
+            # Calculate metrics for current month + last 3 months
+            months_data = []
 
-            # Calculate metrics based on Date of Service
-            collections_dos = 0.0
-            charges_dos = 0.0
-            visits_dos = 0
+            for months_back in range(4):  # 0 = current month, 1-3 = previous months
+                # Calculate the target month
+                target_month_date = latest_date - pd.DateOffset(months=months_back)
+                target_year = target_month_date.year
+                target_month = target_month_date.month
 
-            if not df_dos.empty:
-                # Collections from total_payment
-                if 'total_payment' in df_dos.columns:
-                    collections_dos = float(df_dos['total_payment'].sum())
+                # Calculate date range for this month
+                first_of_target_month = datetime(target_year, target_month, 1)
 
-                # Charges (excluding negative values)
-                if 'charge' in df_dos.columns:
-                    charges_dos = float(df_dos[df_dos['charge'] > 0]['charge'].sum())
+                # Use the same day of month, but cap at last day of month if needed
+                import calendar
+                last_day_of_target_month = calendar.monthrange(target_year, target_month)[1]
+                end_day = min(day_of_month, last_day_of_target_month)
+                last_of_range = datetime(target_year, target_month, end_day)
 
-                # Visits
-                visits_dos = len(df_dos)
+                month_label = f"{first_of_target_month.strftime('%b %d')} - {last_of_range.strftime('%b %d, %Y')}"
+                logger.info(f"Calculating for month {months_back}: {month_label}")
 
-            # Calculate metrics based on Date Created (using transaction_date)
-            collections_dc = 0.0
-            charges_dc = 0.0
-            visits_dc = 0
-
-            # Use transaction_date for date created
-            if 'transaction_date' in df_copy.columns:
-                df_copy['transaction_date'] = pd.to_datetime(df_copy['transaction_date'], errors='coerce')
-
-                # Filter rows where transaction_date is in month to date
-                df_dc = df_copy[
-                    (df_copy['transaction_date'].notna()) &
-                    (df_copy['transaction_date'] >= first_of_month) &
-                    (df_copy['transaction_date'] <= latest_date)
+                # Filter data for this month range
+                df_month = df_copy[
+                    (df_copy[date_col] >= first_of_target_month) &
+                    (df_copy[date_col] <= last_of_range)
                 ]
 
-                if not df_dc.empty:
-                    # Collections from total_payment
-                    if 'total_payment' in df_dc.columns:
-                        collections_dc = float(df_dc['total_payment'].sum())
+                # Calculate metrics based on visit_date (used for both DOS and DC)
+                calc = KPICalculator(df_month) if not df_month.empty else None
+                collections = calc._calculate_filtered_payments() if calc else 0.0
+                charges = calc._calculate_filtered_charges() if calc else 0.0
+                visits = calc.calculate_total_visits() if calc else 0
 
-                    # Charges (excluding negative values)
-                    if 'charge' in df_dc.columns:
-                        charges_dc = float(df_dc[df_dc['charge'] > 0]['charge'].sum())
-
-                    # Visits
-                    visits_dc = len(df_dc)
+                months_data.append({
+                    "month_label": month_label,
+                    "month_name": first_of_target_month.strftime('%B %Y'),
+                    "collections_dos": collections,
+                    "collections_dc": collections,  # Same as DOS since both use visit_date
+                    "charges_dos": charges,
+                    "charges_dc": charges,  # Same as DOS since both use visit_date
+                    "visits_dos": visits,
+                    "visits_dc": visits  # Same as DOS since both use visit_date
+                })
 
             return {
                 "company": company_name,
                 "generated_at": datetime.now().isoformat(),
-                "month_label": month_label,
-                "monthly_comparison": {
-                    "collections_dos": collections_dos,
-                    "collections_dc": collections_dc,
-                    "charges_dos": charges_dos,
-                    "charges_dc": charges_dc,
-                    "visits_dos": visits_dos,
-                    "visits_dc": visits_dc
-                }
+                "day_range": f"1-{day_of_month}",
+                "months_data": months_data
             }
 
         except Exception as e:
@@ -1293,6 +1262,7 @@ class KPICalculator:
     def format_monthly_comparison_as_text(self, report: Dict[str, Any]) -> str:
         """
         Format the month-to-date comparison report as human-readable text.
+        Shows 4 months (current + last 3) with same day range.
 
         Args:
             report: Report dictionary from generate_monthly_comparison_report()
@@ -1301,27 +1271,29 @@ class KPICalculator:
             Formatted text month-to-date comparison report
         """
         company = report["company"]
-        month_label = report.get("month_label", "")
+        day_range = report.get("day_range", "")
 
         if "error" in report:
             return f"❌ Error: {report['error']}"
 
-        comparison = report.get("monthly_comparison", {})
+        months_data = report.get("months_data", [])
 
-        if not comparison:
+        if not months_data:
             return f"❌ No month-to-date comparison data available."
 
-        # Format output as markdown table
-        output = f"""## SLIDE 8: {company.upper()} - CLIENT SUMMARY MONTH TO DATE ({month_label})
+        # Format output as markdown table with all 4 months
+        output = f"""## SLIDE 8: {company.upper()} - CLIENT SUMMARY MONTH TO DATE (Day Range: {day_range})
 
-| Metric | Based on Date of Service | Based on Date Created |
-|--------|--------------------------|----------------------|
-| Collections | ${comparison['collections_dos']:,.2f} | ${comparison['collections_dc']:,.2f} |
-| Charges | ${comparison['charges_dos']:,.2f} | ${comparison['charges_dc']:,.2f} |
-| Visits | {comparison['visits_dos']:,} | {comparison['visits_dc']:,} |
+| Month | Collections | Charges | Visits |
+|-------|-------------|---------|--------|"""
 
-*Generated: {report['generated_at']}*
-"""
+        for month in months_data:
+            month_name = month['month_name']
+            collections = month['collections_dc']  # Using visit_date
+            charges = month['charges_dc']
+            visits = month['visits_dc']
+            output += f"\n| {month_name} | ${collections:,.2f} | ${charges:,.2f} | {visits:,} |"
+
         return output.strip()
 
     def generate_yearly_report(self, company_name: str = "Company") -> Dict[str, Any]:
@@ -1499,8 +1471,6 @@ class KPICalculator:
 | Billed AR | {' | '.join(f"${kpis.get('billed_ar', 0):,.2f}" for kpis in years_kpis)} |
 | Unbilled AR | {' | '.join(f"${kpis.get('unbilled_ar', 0):,.2f}" for kpis in years_kpis)} |
 | Denial vs Resolution (%) | {' | '.join(f"{kpis.get('denial_resolution_rate_pct', 0):.2f}%" for kpis in years_kpis)} |
-
-*Generated: {report['generated_at']}*
 """
 
         return output.strip()
@@ -1701,8 +1671,6 @@ class KPICalculator:
 | Unbilled AR | ${kpis.get('unbilled_ar', 0):,.2f} |
 | Unbilled AR (%) | {kpis.get('unbilled_ar_pct', 0):.2f}% |
 | Denial vs Resolution (%) | {kpis.get('denial_resolution_rate_pct', 0):.2f}% |
-
-*Generated: {report['generated_at']}*
 """
         return output.strip()
 
@@ -1856,8 +1824,6 @@ class KPICalculator:
 | A/R (31-60 Days) | ${kpis['ar_31_60_days']:,.2f} |
 | A/R (60+ Days) | ${kpis['ar_60_plus_days']:,.2f} |
 | Denial vs Resolution (%) | {kpis['denial_resolution_rate_pct']:.2f}% |
-
-*Generated: {report['generated_at']}*
 """
         return output.strip()
 
@@ -2076,8 +2042,6 @@ class KPICalculator:
         total_row += f" **{grand_total}** |"
         output += total_row + "\n"
 
-        output += f"\n*Generated: {report['generated_at']}*\n"
-
         return output.strip()
 
     def generate_denial_categories_report(self, company_name: str = "Company") -> Dict[str, Any]:
@@ -2155,38 +2119,26 @@ class KPICalculator:
         df_denied[desc_col] = df_denied[desc_col].astype(str)
         df_denied = df_denied[df_denied[desc_col].str.lower() != 'nan']
 
-        # Exclude descriptions starting with CO-45, CO45, PR-1, PR-2, PR-3, PR1, PR2, PR3
+        # Normalize descriptions: strip whitespace and reduce multiple spaces to single space
+        df_denied[desc_col] = df_denied[desc_col].str.strip().str.replace(r'\s+', ' ', regex=True)
+
+        # Extract denial code (part before the colon, e.g., "CO-16" from "CO-16: Description...")
+        # Create a new column for the denial code
+        df_denied['denial_code'] = df_denied[desc_col].str.split(':').str[0].str.strip()
+
+        # Keep the full description for reference but group by code
+        df_denied['full_description'] = df_denied[desc_col]
+
+        # Use denial_code as the grouping column
+        code_col = 'denial_code'
+
+        # Exclude codes starting with CO-45, CO45, PR-1, PR-2, PR-3, PR1, PR2, PR3
         excluded_prefixes = ['CO-45', 'CO45', 'PR-1', 'PR1', 'PR-2', 'PR2', 'PR-3', 'PR3']
         for prefix in excluded_prefixes:
-            df_denied = df_denied[~df_denied[desc_col].str.upper().str.startswith(prefix.upper())]
+            df_denied = df_denied[~df_denied[code_col].str.upper().str.startswith(prefix.upper())]
 
-        # Filter to last completed month
-        date_col = None
-        for col in ['visit_date', 'Visit Date', 'VisitDate', 'date', 'Date']:
-            if col in df_denied.columns:
-                date_col = col
-                break
-
-        if date_col:
-            df_denied[date_col] = pd.to_datetime(df_denied[date_col], errors='coerce')
-            df_denied = df_denied.dropna(subset=[date_col])
-
-            # Find the last completed month
-            latest_date = df_denied[date_col].max()
-            # Get first day of current month
-            first_of_current_month = latest_date.replace(day=1)
-            # Last day of previous month
-            last_day_prev_month = first_of_current_month - timedelta(days=1)
-            # First day of previous month
-            first_day_prev_month = last_day_prev_month.replace(day=1)
-
-            # Filter to last completed month
-            df_denied = df_denied[(df_denied[date_col] >= first_day_prev_month) & (df_denied[date_col] <= last_day_prev_month)]
-
-            # Store month name for display
-            month_label = first_day_prev_month.strftime('%B %Y')
-        else:
-            month_label = "All Time"
+        # Show all-time data (no date filtering)
+        month_label = "All Time"
 
         if df_denied.empty:
             return {
@@ -2202,22 +2154,26 @@ class KPICalculator:
         # Get unique states
         states = sorted(df_denied[state_col].dropna().unique().tolist())
 
-        # Group by denial description and calculate totals
-        denial_totals = df_denied.groupby(desc_col).agg(
-            total_visits=('visit_id' if 'visit_id' in df_denied.columns else desc_col, 'count'),
-            total_expected=(expected_col, 'sum')
+        # Group by denial code and calculate totals, also get a sample description for each code
+        denial_totals = df_denied.groupby(code_col).agg(
+            total_visits=('visit_id' if 'visit_id' in df_denied.columns else code_col, 'count'),
+            total_expected=(expected_col, 'sum'),
+            sample_description=('full_description', 'first')  # Get first description as sample
         ).reset_index()
 
         # Sort by total visits and get top 15
         denial_totals = denial_totals.nlargest(15, 'total_visits')
-        categories = denial_totals[desc_col].tolist()
+        categories = denial_totals[code_col].tolist()
+
+        # Create a mapping of code to description for display
+        code_to_description = dict(zip(denial_totals[code_col], denial_totals['sample_description']))
 
         # Build data matrix
         data = {}
         for category in categories:
             data[category] = {}
             for state in states:
-                state_data = df_denied[(df_denied[desc_col] == category) & (df_denied[state_col] == state)]
+                state_data = df_denied[(df_denied[code_col] == category) & (df_denied[state_col] == state)]
                 visit_count = len(state_data)
                 expected_sum = state_data[expected_col].sum() if not state_data.empty else 0
                 data[category][state] = {
@@ -2228,7 +2184,7 @@ class KPICalculator:
         # Calculate totals per category
         category_totals = {}
         for category in categories:
-            cat_data = df_denied[df_denied[desc_col] == category]
+            cat_data = df_denied[df_denied[code_col] == category]
             category_totals[category] = {
                 'visit_count': len(cat_data),
                 'expected': float(cat_data[expected_col].sum())
@@ -2239,7 +2195,7 @@ class KPICalculator:
         for state in states:
             state_data = df_denied[df_denied[state_col] == state]
             # Only count for the top 15 categories
-            state_top15 = state_data[state_data[desc_col].isin(categories)]
+            state_top15 = state_data[state_data[code_col].isin(categories)]
             state_totals[state] = {
                 'visit_count': len(state_top15),
                 'expected': float(state_top15[expected_col].sum())
@@ -2254,6 +2210,7 @@ class KPICalculator:
         return {
             "company": company_name,
             "categories": categories,
+            "code_to_description": code_to_description,
             "states": states,
             "data": data,
             "category_totals": category_totals,
@@ -2275,6 +2232,7 @@ class KPICalculator:
         """
         company = report.get("company", "Company")
         categories = report.get("categories", [])
+        code_to_description = report.get("code_to_description", {})
         states = report.get("states", [])
         data = report.get("data", {})
         category_totals = report.get("category_totals", {})
@@ -2290,8 +2248,8 @@ class KPICalculator:
 
         # Build output as markdown table
         # Header row
-        header = "| Denial Description |"
-        separator = "|-------------------|"
+        header = "| Denial Code | Description |"
+        separator = "|-------------|-------------|"
         for state in states:
             header += f" {state} Count | {state} Expected |"
             separator += "------|------|"
@@ -2304,9 +2262,13 @@ class KPICalculator:
 
         # Data rows
         for category in categories:
-            # Truncate long descriptions
-            display_cat = str(category)[:50] + "..." if len(str(category)) > 50 else str(category)
-            row = f"| {display_cat} |"
+            # Show code and description separately
+            code = str(category)
+            description = code_to_description.get(category, "")
+            # Extract just the description part (after the colon)
+            if ':' in description:
+                description = description.split(':', 1)[1].strip()
+            row = f"| {code} | {description} |"
             for state in states:
                 state_data = data.get(category, {}).get(state, {'visit_count': 0, 'expected': 0})
                 visit_count = state_data['visit_count']
@@ -2314,8 +2276,8 @@ class KPICalculator:
                 row += f" {visit_count} | ${expected:,.2f} |"
             output += row + "\n"
 
-        # Total row
-        total_row = "| **Total** |"
+        # Total row (spans code and description columns)
+        total_row = "| **Total** | |"  # Empty description column for total row
         for state in states:
             st_totals = state_totals.get(state, {'visit_count': 0, 'expected': 0})
             total_row += f" **{st_totals['visit_count']}** | **${st_totals['expected']:,.2f}** |"
@@ -2510,8 +2472,6 @@ class KPICalculator:
 | Patient Payments Posted | ${patient_payments:,.0f} |
 | A/R Claims processed | {ar_claims_processed:,} |
 | Authorization denials/ Pending claims | {auth_denials_pending:,} |
-
-*Generated: {report['generated_at']}*
 """
 
         return output.strip()
