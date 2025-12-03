@@ -5,7 +5,7 @@ Calculates key performance indicators for RCM (Revenue Cycle Management) weekly 
 # src/utils/kpi_calculator.py
 
 import pandas as pd
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from datetime import datetime, timedelta
 import logging
 
@@ -497,13 +497,15 @@ class KPICalculator:
 
         logger.info(f"Days in AR: ${ending_ar:,.2f} / (${total_charges:,.2f} / {period_days}) = {days_in_ar:.1f} days")
 
-        return int(round(days_in_ar))
+        import math
+        return math.ceil(days_in_ar)
 
     def calculate_ar_31_60_days(self) -> float:
         """
         Calculate A/R in 31-60 day bucket.
 
         Formula: Sum of Balance where age is between 31-60 days
+        Age is calculated from bill_date to current date.
         """
         # Look for pre-calculated AR aging columns first
         ar_31_60_columns = ['ar_31_60', 'ar_31_60_days', 'ar_bucket_31_60', 'aging_31_60']
@@ -512,9 +514,9 @@ class KPICalculator:
             if col in self.df.columns:
                 return float(self.df[col].sum())
 
-        # Calculate from visit_date and balance columns
+        # Calculate from bill_date and balance columns
         date_col = None
-        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
+        date_columns = ['bill_date', 'billdate', 'billed_date', 'claim_date', 'submission_date']
         for col in date_columns:
             if col in self.df.columns:
                 date_col = col
@@ -548,6 +550,7 @@ class KPICalculator:
         Calculate A/R in 60-90 day bucket.
 
         Formula: Sum of Balance where age is between 60-90 days
+        Age is calculated from bill_date to current date.
         """
         # Look for pre-calculated AR aging columns first
         ar_60_plus_columns = ['ar_60_plus', 'ar_60+', 'ar_60_days', 'ar_over_60', 'ar_bucket_60_plus', 'aging_60_plus']
@@ -556,9 +559,9 @@ class KPICalculator:
             if col in self.df.columns:
                 return float(self.df[col].sum())
 
-        # Calculate from visit_date and balance columns
+        # Calculate from bill_date and balance columns
         date_col = None
-        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
+        date_columns = ['bill_date', 'billdate', 'billed_date', 'claim_date', 'submission_date']
         for col in date_columns:
             if col in self.df.columns:
                 date_col = col
@@ -651,6 +654,29 @@ class KPICalculator:
         """
         logger.info(f"Generating weekly report for {company_name}...")
 
+        # Import new DAR function for weekly KPI
+        from src.utils.kpi_calculations import calculate_days_in_ar_weekly
+
+        # Calculate ending AR and total charges for DAR
+        ending_ar = 0.0
+        balance_columns = ['balance', 'ar', 'ar_balance', 'outstanding_balance']
+        for col in balance_columns:
+            if col in self.df.columns:
+                ending_ar = float(self.df[col].sum())
+                break
+        if ending_ar == 0.0:
+            ending_ar = self.calculate_total_charges() - self.calculate_total_payments()
+
+        total_charges = self.calculate_total_charges()
+
+        # Find date column for DAR calculation
+        date_col = 'visit_date'
+        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
+        for col in date_columns:
+            if col in self.df.columns:
+                date_col = col
+                break
+
         report = {
             "company": company_name,
             "generated_at": datetime.now().isoformat(),
@@ -661,7 +687,7 @@ class KPICalculator:
                 "payments": self.calculate_total_payments(),
                 "gross_collection_rate_pct": round(self.calculate_gross_collection_rate(), 2),
                 "net_collection_rate_pct": round(self.calculate_net_collection_rate(), 2),
-                "days_in_ar": self.calculate_days_in_ar(),
+                "days_in_ar": calculate_days_in_ar_weekly(ending_ar, total_charges, self.df, date_col),
                 "ar_31_60_days": self.calculate_ar_31_60_days(),
                 "ar_60_plus_days": self.calculate_ar_60_plus_days(),
                 "denial_resolution_rate_pct": round(self.calculate_denial_resolution_rate(), 2),
@@ -699,7 +725,7 @@ class KPICalculator:
             try:
                 # Billed AR = outstanding balance where claim has been submitted to payer
                 # Billed statuses: Claim Created, Approved, Reviewed, Rejected
-                billed_statuses = ['claim created', 'approved', 'reviewed', 'rejected']
+                billed_statuses = ['claim created']
                 billed_mask = self.df[status_col].astype(str).str.lower().str.strip().isin(billed_statuses)
                 return float(self.df.loc[billed_mask, balance_col].sum())
             except Exception as e:
@@ -779,9 +805,117 @@ class KPICalculator:
         total_ar = billed_ar + unbilled_ar
         return self._safe_divide(unbilled_ar, total_ar, 0.0) * 100
 
+    def _get_previous_3_complete_months(self, year: int, month: int) -> List[Tuple[int, int]]:
+        """
+        Get the 3 complete months prior to the target month.
+
+        Args:
+            year: Target year
+            month: Target month (1-12)
+
+        Returns:
+            List of (year, month) tuples for the 3 previous complete months
+        """
+        months = []
+        for i in range(3, 0, -1):
+            target_month = month - i
+            target_year = year
+
+            # Handle year boundary
+            while target_month < 1:
+                target_month += 12
+                target_year -= 1
+
+            months.append((target_year, target_month))
+
+        return months
+
+    def _get_tuesday_monday_weeks(self, year: int, month: int) -> List[Dict[str, Any]]:
+        """
+        Get all Tuesday-Monday week boundaries for a given month.
+
+        Weeks are defined as Tuesday-Monday (ending on Monday).
+        Week 1 starts on the 1st of the month and ends on the first Monday.
+        Subsequent weeks are Tuesday-Monday (7 days).
+
+        Args:
+            year: Year
+            month: Month (1-12)
+
+        Returns:
+            List of dictionaries with week info:
+            - week_num: Week number (1, 2, 3, ...)
+            - start_date: Start date of week
+            - end_date: End date of week (Monday)
+            - days: Number of days in week
+        """
+        import calendar
+
+        # First and last day of month
+        first_day = datetime(year, month, 1)
+        last_day_num = calendar.monthrange(year, month)[1]
+        last_day = datetime(year, month, last_day_num)
+
+        weeks = []
+        week_num = 1
+        current_date = first_day
+
+        # Week 1: Month start to first Monday
+        # Find first Monday
+        first_monday = first_day
+        while first_monday.weekday() != 0:  # 0 = Monday
+            first_monday += timedelta(days=1)
+            if first_monday.month != month:
+                # No Monday in first week (month ends before Monday)
+                first_monday = last_day
+                break
+
+        weeks.append({
+            'week_num': week_num,
+            'start_date': first_day,
+            'end_date': first_monday,
+            'days': (first_monday - first_day).days + 1
+        })
+
+        week_num += 1
+        current_date = first_monday + timedelta(days=1)  # Next day (Tuesday)
+
+        # Remaining weeks: Tuesday-Monday
+        while current_date <= last_day:
+            # Find next Monday (end of week)
+            next_monday = current_date
+            for _ in range(7):
+                if next_monday.weekday() == 0:  # Found Monday
+                    break
+                next_monday += timedelta(days=1)
+                if next_monday > last_day:
+                    next_monday = last_day
+                    break
+
+            # If we've moved past the current date
+            if next_monday >= current_date:
+                weeks.append({
+                    'week_num': week_num,
+                    'start_date': current_date,
+                    'end_date': next_monday,
+                    'days': (next_monday - current_date).days + 1
+                })
+
+                week_num += 1
+                current_date = next_monday + timedelta(days=1)  # Next Tuesday
+
+        return weeks
+
     def generate_weekly_breakdown_report(self, company_name: str = "Company", year: int = None, month: int = None) -> Dict[str, Any]:
         """
-        Generate a weekly breakdown report for a specific month.
+        Generate a weekly breakdown report for a specific month with Tuesday-Monday weeks.
+
+        Weeks are defined as Tuesday-Monday (ending on Monday).
+        Week 1: Month start to first Monday
+        Week 2+: Tuesday to Monday (7 days, may be partial for last week)
+
+        Both Forecast and Actuals use Visit Created Date column.
+        If column not available, shows "visit created date not available" for all metrics.
 
         Args:
             company_name: Name of the company for the report
@@ -793,30 +927,72 @@ class KPICalculator:
         """
         logger.info(f"Generating weekly breakdown report for {company_name}...")
 
-        # Find date column
-        date_col = None
-        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date', 'transaction_date', 'claim_date']
-        for col in date_columns:
-            if col in self.df.columns:
-                date_col = col
-                break
-
-        if date_col is None:
-            logger.warning("No date column found. Cannot generate weekly breakdown report.")
-            return {
-                "company": company_name,
-                "year": year,
-                "month": month,
-                "generated_at": datetime.now().isoformat(),
-                "error": "No date field found in data.",
-                "weeks": {}
-            }
-
         try:
-            # Parse dates
+            # Step 1: Check for Visit Created Date column (REQUIRED for both forecast and actuals)
+            created_date_col = None
+            created_date_columns = ['visit_created_date', 'visitcreateddate', 'created_date', 'date_created']
+            for col in created_date_columns:
+                if col in self.df.columns:
+                    created_date_col = col
+                    break
+
+            if created_date_col is None:
+                logger.warning("Visit Created Date column not found - forecast and actuals will not be available")
+                # Still need to determine year/month for week structure
+                # Try to get from visit_date as fallback for date detection only
+                visit_date_col = None
+                visit_date_columns = ['visit_date', 'visitdate', 'date', 'dos', 'date_of_service']
+                for col in visit_date_columns:
+                    if col in self.df.columns:
+                        visit_date_col = col
+                        break
+
+                if visit_date_col:
+                    df_temp = self.df.copy()
+                    df_temp[visit_date_col] = pd.to_datetime(df_temp[visit_date_col], errors='coerce')
+                    if year is None or month is None:
+                        latest_date = df_temp[visit_date_col].max()
+                        if pd.notna(latest_date):
+                            year = latest_date.year
+                            month = latest_date.month
+
+                # If still no year/month, use current date
+                if year is None or month is None:
+                    now = datetime.now()
+                    year = now.year
+                    month = now.month
+
+                # Generate week structure with "not available" messages
+                weeks = self._get_tuesday_monday_weeks(year, month)
+                weekly_data = {}
+                for week_info in weeks:
+                    week_num = week_info['week_num']
+                    weekly_data[f"week_{week_num}"] = {
+                        "week": week_num,
+                        "week_start": week_info['start_date'].strftime('%Y-%m-%d'),
+                        "week_end": week_info['end_date'].strftime('%Y-%m-%d'),
+                        "days": week_info['days'],
+                        "forecasted_visits": "visit created date not available",
+                        "actual_visits": "visit created date not available",
+                        "forecasted_collections": "visit created date not available",
+                        "actual_collections": "visit created date not available",
+                    }
+
+                return {
+                    "company": company_name,
+                    "year": year,
+                    "month": month,
+                    "month_name": datetime(year, month, 1).strftime('%B'),
+                    "generated_at": datetime.now().isoformat(),
+                    "avg_daily_visits": "visit created date not available",
+                    "avg_daily_collections": "visit created date not available",
+                    "weeks": weekly_data
+                }
+
+            # Parse Visit Created Date
             df_copy = self.df.copy()
-            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
-            df_copy = df_copy[df_copy[date_col].notna()]
+            df_copy[created_date_col] = pd.to_datetime(df_copy[created_date_col], errors='coerce')
+            df_copy = df_copy[df_copy[created_date_col].notna()]
 
             if df_copy.empty:
                 return {
@@ -824,117 +1000,100 @@ class KPICalculator:
                     "year": year,
                     "month": month,
                     "generated_at": datetime.now().isoformat(),
-                    "error": "No valid dates found in data.",
+                    "error": "No valid dates found in Visit Created Date column.",
                     "weeks": {}
                 }
 
-            # Auto-detect latest year/month if not specified
+            # Auto-detect latest year/month if not specified (using visit_created_date)
             if year is None or month is None:
-                latest_date = df_copy[date_col].max()
+                latest_date = df_copy[created_date_col].max()
                 year = latest_date.year
                 month = latest_date.month
                 logger.info(f"Auto-detected latest month: {year}-{month:02d}")
 
-            # Filter for specific year and month
-            df_filtered = df_copy[
-                (df_copy[date_col].dt.year == year) &
-                (df_copy[date_col].dt.month == month)
-            ]
+            # Step 2: Get previous 3 complete months for forecasting
+            prev_3_months = self._get_previous_3_complete_months(year, month)
+            logger.info(f"Using previous 3 complete months for forecast: {prev_3_months}")
 
-            if df_filtered.empty:
-                return {
-                    "company": company_name,
-                    "year": year,
-                    "month": month,
-                    "generated_at": datetime.now().isoformat(),
-                    "error": f"No data found for {year}-{month:02d}.",
-                    "weeks": {}
-                }
+            # Filter data for previous 3 complete months (using Visit Created Date)
+            df_three_months = pd.DataFrame()
+            total_days_in_3_months = 0
 
-            # Calculate 3-month average for forecasting
-            # Get the date 3 months ago from the target month
-            first_of_target_month = datetime(year, month, 1)
-            three_months_ago = first_of_target_month - timedelta(days=90)
+            for prev_year, prev_month in prev_3_months:
+                import calendar
+                days_in_month = calendar.monthrange(prev_year, prev_month)[1]
+                total_days_in_3_months += days_in_month
 
-            # Filter last 3 months of data for calculating averages
-            df_three_months = df_copy[
-                (df_copy[date_col] >= three_months_ago) &
-                (df_copy[date_col] < first_of_target_month)
-            ]
+                month_start = datetime(prev_year, prev_month, 1)
+                month_end = datetime(prev_year, prev_month, days_in_month)
 
-            # Calculate number of days in the 3-month period
-            if not df_three_months.empty:
-                min_date = df_three_months[date_col].min()
-                max_date = df_three_months[date_col].max()
-                days_in_three_months = (max_date - min_date).days + 1
-            else:
-                days_in_three_months = 90  # Default to 90 days
+                month_data = df_copy[
+                    (df_copy[created_date_col] >= month_start) &
+                    (df_copy[created_date_col] <= month_end)
+                ]
+                df_three_months = pd.concat([df_three_months, month_data])
 
             # Calculate 3-month daily averages
             total_visits_3m = len(df_three_months) if not df_three_months.empty else 0
-            avg_daily_visits = total_visits_3m / days_in_three_months if days_in_three_months > 0 else 0
+            avg_daily_visits = total_visits_3m / total_days_in_3_months if total_days_in_3_months > 0 else 0
 
-            # Collections: total payment (excluding negatives) in 3 months / days
+            # Collections: total payment from 3 months
             if 'total_payment' in df_three_months.columns and not df_three_months.empty:
                 total_collections_3m = float(df_three_months[df_three_months['total_payment'] > 0]['total_payment'].sum())
             else:
                 total_collections_3m = 0.0
-            avg_daily_collections = total_collections_3m / days_in_three_months if days_in_three_months > 0 else 0
+            avg_daily_collections = total_collections_3m / total_days_in_3_months if total_days_in_3_months > 0 else 0
 
-            # Add week number (week of month)
-            df_filtered['day_of_month'] = df_filtered[date_col].dt.day
-            df_filtered['week_of_month'] = ((df_filtered['day_of_month'] - 1) // 7) + 1
+            logger.info(f"3-month averages: {avg_daily_visits:.2f} visits/day, ${avg_daily_collections:,.2f} collections/day")
 
-            # Calculate actual days in each week of the target month
-            import calendar
-            last_day_of_month = calendar.monthrange(year, month)[1]
+            # Step 3: Get Tuesday-Monday weeks for target month
+            weeks = self._get_tuesday_monday_weeks(year, month)
+            logger.info(f"Generated {len(weeks)} Tuesday-Monday weeks for {year}-{month:02d}")
 
-            def get_days_in_week(week_num):
-                """Calculate actual number of days in a specific week of the month"""
-                start_day = (week_num - 1) * 7 + 1
-                end_day = min(week_num * 7, last_day_of_month)
-                return end_day - start_day + 1
-
-            # Group by week of month and calculate metrics for each week
-            weekly_data = {}
-            weeks_sorted = sorted(df_filtered['week_of_month'].unique())
-
-            # Calculate cumulative values
-            cumulative_forecasted_visits = 0
+            # Step 4: Calculate cumulative forecasts and actuals for each week
+            cumulative_days = 0
             cumulative_actual_visits = 0
-            cumulative_forecasted_collections = 0.0
             cumulative_actual_collections = 0.0
 
-            for week_num in weeks_sorted:
-                # Get actual number of days in this week
-                days_in_week = get_days_in_week(week_num)
+            weekly_data = {}
 
-                # Calculate forecast for this week based on actual days
-                forecasted_visits_per_week = avg_daily_visits * days_in_week
-                forecasted_collections_per_week = avg_daily_collections * days_in_week
-                week_df = df_filtered[df_filtered['week_of_month'] == week_num]
+            for week_info in weeks:
+                week_num = week_info['week_num']
+                week_start = week_info['start_date']
+                week_end = week_info['end_date']
+                days_in_week = week_info['days']
 
-                # Actual visits for this week
+                # Cumulative forecast (using Visit Created Date)
+                cumulative_days += days_in_week
+                cumulative_forecasted_visits = round(avg_daily_visits * cumulative_days)
+                cumulative_forecasted_collections = avg_daily_collections * cumulative_days
+
+                # Actual values for this week (using Visit Created Date)
+                week_df = df_copy[
+                    (df_copy[created_date_col].notna()) &
+                    (df_copy[created_date_col] >= week_start) &
+                    (df_copy[created_date_col] <= week_end)
+                ]
+
                 actual_visits = len(week_df)
-
-                # Actual collections for this week (excluding negative values)
                 if 'total_payment' in week_df.columns:
                     actual_collections = float(week_df[week_df['total_payment'] > 0]['total_payment'].sum())
                 else:
                     actual_collections = 0.0
 
-                # Add to cumulative totals
-                cumulative_forecasted_visits += round(forecasted_visits_per_week)
+                # Add to cumulative actuals
                 cumulative_actual_visits += actual_visits
-                cumulative_forecasted_collections += forecasted_collections_per_week
                 cumulative_actual_collections += actual_collections
 
-                weekly_data[f"week_{int(week_num)}"] = {
-                    "week": int(week_num),
+                weekly_data[f"week_{week_num}"] = {
+                    "week": week_num,
+                    "week_start": week_start.strftime('%Y-%m-%d'),
+                    "week_end": week_end.strftime('%Y-%m-%d'),
+                    "days": days_in_week,
                     "forecasted_visits": cumulative_forecasted_visits,
                     "actual_visits": cumulative_actual_visits,
-                    "forecasted_collections": cumulative_forecasted_collections,
-                    "actual_collections": cumulative_actual_collections,
+                    "forecasted_collections": round(cumulative_forecasted_collections, 2),
+                    "actual_collections": round(cumulative_actual_collections, 2),
                 }
 
             logger.info(f"Weekly breakdown report generated for {year}-{month:02d}")
@@ -944,6 +1103,9 @@ class KPICalculator:
                 "month": month,
                 "month_name": datetime(year, month, 1).strftime('%B'),
                 "generated_at": datetime.now().isoformat(),
+                "forecast_period": f"{prev_3_months[0][0]}-{prev_3_months[0][1]:02d} to {prev_3_months[2][0]}-{prev_3_months[2][1]:02d}",
+                "avg_daily_visits": round(avg_daily_visits, 2),
+                "avg_daily_collections": round(avg_daily_collections, 2),
                 "weeks": weekly_data
             }
 
@@ -995,7 +1157,20 @@ class KPICalculator:
             week_num = week_data['week']
             forecasted_collections = week_data.get('forecasted_collections', 0)
             actual_collections = week_data.get('actual_collections', 0)
-            output += f"| Week {week_num} | ${forecasted_collections:,.2f} | ${actual_collections:,.2f} |\n"
+
+            # Format forecasted collections (handle string if visit_created_date not available)
+            if isinstance(forecasted_collections, str):
+                forecasted_collections_str = forecasted_collections
+            else:
+                forecasted_collections_str = f"${forecasted_collections:,.2f}"
+
+            # Format actual collections (handle string if visit_created_date not available)
+            if isinstance(actual_collections, str):
+                actual_collections_str = actual_collections
+            else:
+                actual_collections_str = f"${actual_collections:,.2f}"
+
+            output += f"| Week {week_num} | {forecasted_collections_str} | {actual_collections_str} |\n"
 
         output += f"""
 ### Weekly Visits
@@ -1007,7 +1182,20 @@ class KPICalculator:
             week_num = week_data['week']
             forecasted_visits = week_data.get('forecasted_visits', 0)
             actual_visits = week_data.get('actual_visits', 0)
-            output += f"| Week {week_num} | {forecasted_visits:,} | {actual_visits:,} |\n"
+
+            # Format forecasted visits (handle string if visit_created_date not available)
+            if isinstance(forecasted_visits, str):
+                forecasted_visits_str = forecasted_visits
+            else:
+                forecasted_visits_str = f"{forecasted_visits:,}"
+
+            # Format actual visits (handle string if visit_created_date not available)
+            if isinstance(actual_visits, str):
+                actual_visits_str = actual_visits
+            else:
+                actual_visits_str = f"{actual_visits:,}"
+
+            output += f"| Week {week_num} | {forecasted_visits_str} | {actual_visits_str} |\n"
 
         return output.strip()
 
@@ -1055,38 +1243,57 @@ class KPICalculator:
                     "weekly_comparison": {}
                 }
 
-            # Find the latest complete Monday-Sunday week
+            # Get the last 7 days from the most recent date in the data
             latest_date = df_copy[date_col].max()
+            week_end = latest_date
+            week_start = latest_date - timedelta(days=6)  # Go back 6 days to get 7 days total
 
-            # Find the most recent Sunday (end of week)
-            days_since_sunday = (latest_date.weekday() + 1) % 7  # Monday=0, Sunday=6
-            if days_since_sunday == 0:
-                # Today is Sunday, use last week
-                week_end = latest_date - timedelta(days=7)
-            else:
-                # Go back to last Sunday
-                week_end = latest_date - timedelta(days=days_since_sunday)
+            logger.info(f"Last 7 days: {week_start.date()} to {week_end.date()}")
 
-            # Week starts on Monday (6 days before Sunday)
-            week_start = week_end - timedelta(days=6)
-
-            logger.info(f"Latest complete week (Mon-Sun): {week_start.date()} to {week_end.date()}")
-
-            # Filter for latest week based on Date of Service
+            # Filter for latest week based on Date of Service (for visits)
             df_dos = df_copy[
                 (df_copy[date_col] >= week_start) &
                 (df_copy[date_col] <= week_end)
             ]
 
-            # Calculate metrics based on Date of Service (using visit_date)
+            # Calculate visits based on visit_date
+            visits_dos = len(df_dos) if not df_dos.empty else 0
+
+            # Find transaction_date column for collections
+            transaction_date_col = None
+            transaction_date_columns = ['transaction_date', 'transactiondate', 'payment_date', 'date_created']
+            for col in transaction_date_columns:
+                if col in df_copy.columns:
+                    transaction_date_col = col
+                    break
+
+            # Calculate collections based on transaction_date (when payment was received)
+            if transaction_date_col:
+                # Parse transaction dates
+                df_copy[transaction_date_col] = pd.to_datetime(df_copy[transaction_date_col], errors='coerce')
+
+                # Filter by transaction_date for collections
+                df_transactions = df_copy[
+                    (df_copy[transaction_date_col].notna()) &
+                    (df_copy[transaction_date_col] >= week_start) &
+                    (df_copy[transaction_date_col] <= week_end)
+                ]
+
+                # Calculate collections from transactions in this week
+                transaction_calc = KPICalculator(df_transactions) if not df_transactions.empty else None
+                collections_dos = transaction_calc._calculate_filtered_payments() if transaction_calc else 0.0
+                logger.info(f"Collections calculated using transaction_date: ${collections_dos:,.2f}")
+            else:
+                # Fallback to visit_date if transaction_date not available
+                dos_calc = KPICalculator(df_dos) if not df_dos.empty else None
+                collections_dos = dos_calc._calculate_filtered_payments() if dos_calc else 0.0
+                logger.warning(f"transaction_date column not found - using visit_date for collections")
+
+            # Charges still use visit_date
             dos_calc = KPICalculator(df_dos) if not df_dos.empty else None
-
-            collections_dos = dos_calc._calculate_filtered_payments() if dos_calc else 0.0
             charges_dos = dos_calc._calculate_filtered_charges() if dos_calc else 0.0
-            visits_dos = dos_calc.calculate_total_visits() if dos_calc else 0
 
-            # Calculate metrics based on Date Created (also using visit_date)
-            # Note: Both columns now use visit_date as requested
+            # For Slide 7, we use single values (not comparison)
             collections_dc = collections_dos
             charges_dc = charges_dos
             visits_dc = visits_dos
@@ -1393,6 +1600,59 @@ class KPICalculator:
                 # Create a temporary calculator for this year's data
                 year_calc = KPICalculator(group_df)
 
+                # Import new DAR and AR functions for yearly report
+                from src.utils.kpi_calculations import (
+                    calculate_days_in_ar_yearly,
+                    calculate_billed_ar_yearly,
+                    calculate_unbilled_ar_yearly
+                )
+
+                # Calculate ending AR and total charges for DAR
+                ending_ar = 0.0
+                balance_columns = ['balance', 'ar', 'ar_balance', 'outstanding_balance']
+                for col in balance_columns:
+                    if col in group_df.columns:
+                        ending_ar = float(group_df[col].sum())
+                        break
+                if ending_ar == 0.0:
+                    ending_ar = year_calc.calculate_total_charges() - year_calc.calculate_total_payments()
+
+                total_charges = year_calc.calculate_total_charges()
+
+                # Find columns for AR calculations
+                balance_col = None
+                for col in balance_columns:
+                    if col in self.df.columns:
+                        balance_col = col
+                        break
+
+                status_col = None
+                status_columns = ['visit_status', 'claim_status', 'status']
+                for col in status_columns:
+                    if col in self.df.columns:
+                        status_col = col
+                        break
+
+                date_col = None
+                date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
+                for col in date_columns:
+                    if col in self.df.columns:
+                        date_col = col
+                        break
+
+                # Calculate billed/unbilled AR with date filtering (year start to today)
+                if balance_col and status_col and date_col:
+                    billed_ar = calculate_billed_ar_yearly(
+                        self.df, balance_col, status_col, date_col, int(year)
+                    )
+                    unbilled_ar = calculate_unbilled_ar_yearly(
+                        self.df, balance_col, status_col, date_col, int(year)
+                    )
+                else:
+                    # Fallback to old method if columns not found
+                    billed_ar = year_calc.calculate_billed_ar()
+                    unbilled_ar = year_calc.calculate_unbilled_ar()
+
                 year_key = f"{int(year)}"
                 yearly_data[year_key] = {
                     "year": int(year),
@@ -1403,9 +1663,9 @@ class KPICalculator:
                         "payments": year_calc.calculate_total_payments(),
                         "gross_collection_rate_pct": round(year_calc.calculate_gross_collection_rate(), 2),
                         "net_collection_rate_pct": round(year_calc.calculate_net_collection_rate(), 2),
-                        "days_in_ar": year_calc.calculate_days_in_ar(),
-                        "billed_ar": year_calc.calculate_billed_ar(),
-                        "unbilled_ar": year_calc.calculate_unbilled_ar(),
+                        "days_in_ar": calculate_days_in_ar_yearly(ending_ar, total_charges, int(year)),
+                        "billed_ar": billed_ar,
+                        "unbilled_ar": unbilled_ar,
                         "denial_resolution_rate_pct": round(year_calc.calculate_denial_resolution_rate(), 2),
                     }
                 }
@@ -1590,6 +1850,63 @@ class KPICalculator:
                 # Create a temporary calculator for this quarter's data
                 quarter_calc = KPICalculator(group_df)
 
+                # Import new DAR and AR functions for quarterly report
+                from src.utils.kpi_calculations import (
+                    calculate_days_in_ar_quarterly,
+                    calculate_billed_ar_quarterly,
+                    calculate_unbilled_ar_quarterly
+                )
+
+                # Calculate ending AR and total charges for DAR
+                ending_ar = 0.0
+                balance_columns = ['balance', 'ar', 'ar_balance', 'outstanding_balance']
+                for col in balance_columns:
+                    if col in group_df.columns:
+                        ending_ar = float(group_df[col].sum())
+                        break
+                if ending_ar == 0.0:
+                    ending_ar = quarter_calc.calculate_total_charges() - quarter_calc.calculate_total_payments()
+
+                total_charges = quarter_calc.calculate_total_charges()
+
+                # Find columns for AR calculations
+                balance_col = None
+                for col in balance_columns:
+                    if col in self.df.columns:
+                        balance_col = col
+                        break
+
+                status_col = None
+                status_columns = ['visit_status', 'claim_status', 'status']
+                for col in status_columns:
+                    if col in self.df.columns:
+                        status_col = col
+                        break
+
+                date_col = None
+                date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
+                for col in date_columns:
+                    if col in self.df.columns:
+                        date_col = col
+                        break
+
+                # Calculate billed/unbilled AR with date filtering (quarter start to today)
+                if balance_col and status_col and date_col:
+                    billed_ar = calculate_billed_ar_quarterly(
+                        self.df, balance_col, status_col, date_col, int(year), int(quarter)
+                    )
+                    unbilled_ar = calculate_unbilled_ar_quarterly(
+                        self.df, balance_col, status_col, date_col, int(year), int(quarter)
+                    )
+                else:
+                    # Fallback to old method if columns not found
+                    billed_ar = quarter_calc.calculate_billed_ar()
+                    unbilled_ar = quarter_calc.calculate_unbilled_ar()
+
+                total_ar = billed_ar + unbilled_ar
+                billed_ar_pct = (billed_ar / total_ar * 100) if total_ar > 0 else 0.0
+                unbilled_ar_pct = (unbilled_ar / total_ar * 100) if total_ar > 0 else 0.0
+
                 quarter_key = f"{int(year)}_Q{int(quarter)}"
                 quarterly_data[quarter_key] = {
                     "year": int(year),
@@ -1601,11 +1918,11 @@ class KPICalculator:
                         "payments": quarter_calc.calculate_total_payments(),
                         "gross_collection_rate_pct": round(quarter_calc.calculate_gross_collection_rate(), 2),
                         "net_collection_rate_pct": round(quarter_calc.calculate_net_collection_rate(), 2),
-                        "days_in_ar": quarter_calc.calculate_days_in_ar(),
-                        "billed_ar": quarter_calc.calculate_billed_ar(),
-                        "billed_ar_pct": round(quarter_calc.calculate_billed_ar_percentage(), 2),
-                        "unbilled_ar": quarter_calc.calculate_unbilled_ar(),
-                        "unbilled_ar_pct": round(quarter_calc.calculate_unbilled_ar_percentage(), 2),
+                        "days_in_ar": calculate_days_in_ar_quarterly(ending_ar, total_charges, int(year), int(quarter)),
+                        "billed_ar": billed_ar,
+                        "billed_ar_pct": round(billed_ar_pct, 2),
+                        "unbilled_ar": unbilled_ar,
+                        "unbilled_ar_pct": round(unbilled_ar_pct, 2),
                         "denial_resolution_rate_pct": round(quarter_calc.calculate_denial_resolution_rate(), 2),
                     }
                 }

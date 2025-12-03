@@ -11,6 +11,7 @@ a calculated value without any formatting.
 
 import pandas as pd
 import logging
+import math
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional, Tuple
 
@@ -143,7 +144,7 @@ def calculate_days_in_ar(
     period_days: int
 ) -> int:
     """
-    Calculate Days in AR (DAR).
+    Calculate Days in AR (DAR) - Generic version.
 
     Formula: Ending AR / (Total Charges / Period Days)
 
@@ -154,6 +155,12 @@ def calculate_days_in_ar(
 
     Returns:
         Days in AR
+
+    Note:
+        For specific report types, use:
+        - calculate_days_in_ar_weekly() for Slide 3 (Weekly KPI)
+        - calculate_days_in_ar_quarterly() for Slide 4 (Quarterly)
+        - calculate_days_in_ar_yearly() for Slide 5 (Yearly)
     """
     if total_charges == 0 or period_days == 0:
         return 0
@@ -163,7 +170,250 @@ def calculate_days_in_ar(
     if average_daily_charges == 0:
         return 0
 
-    return int(ending_ar / average_daily_charges)
+    return math.ceil(ending_ar / average_daily_charges)
+
+
+def calculate_days_in_ar_weekly(
+    ending_ar: float,
+    total_charges: float,
+    df: pd.DataFrame,
+    date_col: str = 'visit_date'
+) -> int:
+    """
+    Calculate Days in AR for Weekly KPI Metrics (Slide 3).
+
+    Period Days Logic:
+    - If data contains full year(s): 365 days (fixed, no leap year adjustment)
+    - If data is current year only: Days from Jan 1 to today
+
+    Formula: Ending AR / (Total Charges / Period Days)
+
+    Args:
+        ending_ar: Outstanding balance
+        total_charges: Total charges
+        df: DataFrame with date column
+        date_col: Name of date column (default: 'visit_date')
+
+    Returns:
+        Days in AR as integer
+    """
+    period_days = _get_period_days_weekly(df, date_col)
+
+    if total_charges == 0 or period_days == 0:
+        return 0
+
+    avg_daily_charges = total_charges / period_days
+    if avg_daily_charges == 0:
+        return 0
+
+    return math.ceil(ending_ar / avg_daily_charges)
+
+
+def calculate_days_in_ar_quarterly(
+    ending_ar: float,
+    total_charges: float,
+    year: int,
+    quarter: int
+) -> int:
+    """
+    Calculate Days in AR for Quarterly Report (Slide 4).
+
+    Period Days Logic:
+    - Complete quarter: Actual days in that quarter (89, 90, or 91)
+    - Current quarter: Days from quarter start to today
+
+    Formula: Ending AR / (Total Charges / Period Days)
+
+    Args:
+        ending_ar: Outstanding balance
+        total_charges: Total charges for the quarter
+        year: Year (e.g., 2024)
+        quarter: Quarter number (1, 2, 3, or 4)
+
+    Returns:
+        Days in AR as integer
+    """
+    period_days = _get_period_days_quarterly(year, quarter)
+
+    if total_charges == 0 or period_days == 0:
+        return 0
+
+    avg_daily_charges = total_charges / period_days
+    if avg_daily_charges == 0:
+        return 0
+
+    return math.ceil(ending_ar / avg_daily_charges)
+
+
+def calculate_days_in_ar_yearly(
+    ending_ar: float,
+    total_charges: float,
+    year: int
+) -> int:
+    """
+    Calculate Days in AR for Yearly Report (Slide 5).
+
+    Period Days Logic:
+    - Complete year: 365 days (fixed, no leap year adjustment)
+    - Current year: Days from Jan 1 to today
+
+    Formula: Ending AR / (Total Charges / Period Days)
+
+    Args:
+        ending_ar: Outstanding balance
+        total_charges: Total charges for the year
+        year: Year (e.g., 2024)
+
+    Returns:
+        Days in AR as integer
+    """
+    period_days = _get_period_days_yearly(year)
+
+    if total_charges == 0 or period_days == 0:
+        return 0
+
+    avg_daily_charges = total_charges / period_days
+    if avg_daily_charges == 0:
+        return 0
+
+    return math.ceil(ending_ar / avg_daily_charges)
+
+
+# ============================================================================
+# HELPER FUNCTIONS FOR DAYS IN AR CALCULATIONS
+# ============================================================================
+
+def _get_period_days_weekly(df: pd.DataFrame, date_col: str) -> int:
+    """
+    Get period days for Weekly KPI (Slide 3).
+
+    Logic:
+    - If data spans full year(s): 365 days (fixed)
+    - If data is current year only: Jan 1 to today
+
+    Args:
+        df: DataFrame with date column
+        date_col: Name of date column
+
+    Returns:
+        Number of days in period
+    """
+    if df.empty or date_col not in df.columns:
+        return 365  # Default to full year
+
+    try:
+        dates = pd.to_datetime(df[date_col], errors='coerce').dropna()
+        if len(dates) == 0:
+            return 365
+
+        min_date = dates.min()
+        max_date = dates.max()
+        today = pd.Timestamp.now().normalize()
+
+        # Get years in data
+        min_year = min_date.year
+        max_year = max_date.year
+        current_year = today.year
+
+        # If data is only from current year
+        if min_year == current_year and max_year == current_year:
+            # Year-to-date: Jan 1 to today
+            year_start = pd.Timestamp(year=current_year, month=1, day=1)
+            period_days = (today - year_start).days + 1
+            logger.info(f"Weekly KPI DAR - Current year only: {period_days} days (YTD)")
+            return period_days
+
+        # Data spans multiple years or complete past years - use 365 days
+        period_days = 365
+        logger.info(f"Weekly KPI DAR - Full year(s) in data: {period_days} days")
+        return period_days
+
+    except Exception as e:
+        logger.warning(f"Error calculating weekly period days: {e}")
+        return 365
+
+
+def _get_period_days_quarterly(year: int, quarter: int) -> int:
+    """
+    Get period days for Quarterly Report (Slide 4).
+
+    Logic:
+    - Complete quarter: Actual days in quarter (89, 90, or 91)
+    - Current quarter: Quarter start to today
+
+    Args:
+        year: Year (e.g., 2024)
+        quarter: Quarter number (1, 2, 3, or 4)
+
+    Returns:
+        Number of days in quarter
+    """
+    import calendar
+
+    # Define quarter start months
+    quarter_starts = {1: 1, 2: 4, 3: 7, 4: 10}  # Jan, Apr, Jul, Oct
+
+    start_month = quarter_starts[quarter]
+
+    # Calculate quarter end
+    if quarter == 4:
+        end_month = 12
+        end_day = 31
+    else:
+        end_month = quarter_starts[quarter + 1] - 1
+        # Get last day of end month
+        end_day = calendar.monthrange(year, end_month)[1]
+
+    quarter_start = pd.Timestamp(year=year, month=start_month, day=1)
+    quarter_end = pd.Timestamp(year=year, month=end_month, day=end_day)
+
+    today = pd.Timestamp.now().normalize()
+
+    # Check if this is the current quarter
+    current_year = today.year
+    current_month = today.month
+    current_quarter = (current_month - 1) // 3 + 1
+
+    if year == current_year and quarter == current_quarter:
+        # Current quarter: quarter start to today
+        period_days = (today - quarter_start).days + 1
+        logger.info(f"Quarterly DAR - Current quarter Q{quarter} {year}: {period_days} days (QTD)")
+    else:
+        # Complete quarter: full quarter days
+        period_days = (quarter_end - quarter_start).days + 1
+        logger.info(f"Quarterly DAR - Complete quarter Q{quarter} {year}: {period_days} days")
+
+    return period_days
+
+
+def _get_period_days_yearly(year: int) -> int:
+    """
+    Get period days for Yearly Report (Slide 5).
+
+    Logic:
+    - Complete year: 365 days (fixed, no leap year adjustment)
+    - Current year: Jan 1 to today
+
+    Args:
+        year: Year (e.g., 2024)
+
+    Returns:
+        Number of days in year
+    """
+    today = pd.Timestamp.now().normalize()
+    current_year = today.year
+
+    if year == current_year:
+        # Current year: Jan 1 to today
+        year_start = pd.Timestamp(year=year, month=1, day=1)
+        period_days = (today - year_start).days + 1
+        logger.info(f"Yearly DAR - Current year {year}: {period_days} days (YTD)")
+    else:
+        # Complete year: always 365 days
+        period_days = 365
+        logger.info(f"Yearly DAR - Complete year {year}: {period_days} days")
+
+    return period_days
 
 
 def calculate_ar_aging(
@@ -255,6 +505,254 @@ def calculate_unbilled_ar(
 
     mask = df_copy[status_col].isin(unbilled_statuses_lower)
     return float(df_copy[mask][balance_col].sum())
+
+
+def calculate_billed_ar_quarterly(
+    df: pd.DataFrame,
+    balance_col: str,
+    status_col: str,
+    date_col: str,
+    year: int,
+    quarter: int
+) -> float:
+    """
+    Calculate Billed AR for Quarterly Report (Slide 4).
+
+    Billed AR = SUM(balance) WHERE visit_status = 'Claim Created'
+    Date Range: Quarter start to today (Quarter-to-date)
+
+    Args:
+        df: DataFrame with balance, status, and date data
+        balance_col: Name of the balance column
+        status_col: Name of the status column (visit_status)
+        date_col: Name of the date column (visit_date)
+        year: Year (e.g., 2024)
+        quarter: Quarter number (1, 2, 3, or 4)
+
+    Returns:
+        Sum of billed AR for the quarter-to-date
+    """
+    if balance_col not in df.columns or status_col not in df.columns or date_col not in df.columns:
+        return 0.0
+
+    try:
+        df_copy = df.copy()
+
+        # Convert date column
+        df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+
+        # Calculate quarter date range
+        quarter_starts = {1: 1, 2: 4, 3: 7, 4: 10}
+        start_month = quarter_starts[quarter]
+        quarter_start = pd.Timestamp(year=year, month=start_month, day=1)
+        today = pd.Timestamp.now().normalize()
+
+        # Filter by status: 'Claim Created' only
+        billed_status = 'claim created'
+        status_mask = df_copy[status_col].astype(str).str.lower().str.strip() == billed_status
+
+        # Filter by date: quarter start to today
+        date_mask = (df_copy[date_col] >= quarter_start) & (df_copy[date_col] <= today)
+
+        # Combined filter
+        combined_mask = status_mask & date_mask
+
+        billed_ar = float(df_copy.loc[combined_mask, balance_col].sum())
+        logger.info(f"Quarterly Billed AR Q{quarter} {year}: ${billed_ar:,.2f} (status='Claim Created', {quarter_start.date()} to {today.date()})")
+
+        return billed_ar
+    except Exception as e:
+        logger.error(f"Error calculating quarterly billed AR: {e}")
+        return 0.0
+
+
+def calculate_unbilled_ar_quarterly(
+    df: pd.DataFrame,
+    balance_col: str,
+    status_col: str,
+    date_col: str,
+    year: int,
+    quarter: int
+) -> float:
+    """
+    Calculate Unbilled AR for Quarterly Report (Slide 4).
+
+    Unbilled AR = SUM(balance) WHERE visit_status != 'Claim Created'
+    (All other statuses besides 'Claim Created')
+    Date Range: Quarter start to today (Quarter-to-date)
+
+    Args:
+        df: DataFrame with balance, status, and date data
+        balance_col: Name of the balance column
+        status_col: Name of the status column (visit_status)
+        date_col: Name of the date column (visit_date)
+        year: Year (e.g., 2024)
+        quarter: Quarter number (1, 2, 3, or 4)
+
+    Returns:
+        Sum of unbilled AR for the quarter-to-date
+    """
+    if balance_col not in df.columns or status_col not in df.columns or date_col not in df.columns:
+        return 0.0
+
+    try:
+        df_copy = df.copy()
+
+        # Convert date column
+        df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+
+        # Calculate quarter date range
+        quarter_starts = {1: 1, 2: 4, 3: 7, 4: 10}
+        start_month = quarter_starts[quarter]
+        quarter_start = pd.Timestamp(year=year, month=start_month, day=1)
+        today = pd.Timestamp.now().normalize()
+
+        # Filter by status: NOT 'Claim Created' (all other statuses)
+        billed_status = 'claim created'
+        status_mask = ~(df_copy[status_col].astype(str).str.lower().str.strip() == billed_status)
+
+        # Filter by date: quarter start to today
+        date_mask = (df_copy[date_col] >= quarter_start) & (df_copy[date_col] <= today)
+
+        # Combined filter
+        combined_mask = status_mask & date_mask
+
+        unbilled_ar = float(df_copy.loc[combined_mask, balance_col].sum())
+        logger.info(f"Quarterly Unbilled AR Q{quarter} {year}: ${unbilled_ar:,.2f} (status!='Claim Created', {quarter_start.date()} to {today.date()})")
+
+        return unbilled_ar
+    except Exception as e:
+        logger.error(f"Error calculating quarterly unbilled AR: {e}")
+        return 0.0
+
+
+def calculate_billed_ar_yearly(
+    df: pd.DataFrame,
+    balance_col: str,
+    status_col: str,
+    date_col: str,
+    year: int
+) -> float:
+    """
+    Calculate Billed AR for Yearly Report (Slide 5).
+
+    Billed AR = SUM(balance) WHERE visit_status = 'Claim Created'
+    Date Range: Year start to today (Year-to-date)
+
+    Args:
+        df: DataFrame with balance, status, and date data
+        balance_col: Name of the balance column
+        status_col: Name of the status column (visit_status)
+        date_col: Name of the date column (visit_date)
+        year: Year (e.g., 2024)
+
+    Returns:
+        Sum of billed AR for the year-to-date
+    """
+    if balance_col not in df.columns or status_col not in df.columns or date_col not in df.columns:
+        return 0.0
+
+    try:
+        df_copy = df.copy()
+
+        # Convert date column
+        df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+
+        # Calculate year date range
+        year_start = pd.Timestamp(year=year, month=1, day=1)
+        today = pd.Timestamp.now().normalize()
+        current_year = today.year
+
+        # Determine year end date
+        if year < current_year:
+            # Complete/past year: use Dec 31 of that year
+            year_end = pd.Timestamp(year=year, month=12, day=31)
+        else:
+            # Current year: use today (Year-to-date)
+            year_end = today
+
+        # Filter by status: 'Claim Created' only
+        billed_status = 'claim created'
+        status_mask = df_copy[status_col].astype(str).str.lower().str.strip() == billed_status
+
+        # Filter by date: year start to year end (Dec 31 for past years, today for current year)
+        date_mask = (df_copy[date_col] >= year_start) & (df_copy[date_col] <= year_end)
+
+        # Combined filter
+        combined_mask = status_mask & date_mask
+
+        billed_ar = float(df_copy.loc[combined_mask, balance_col].sum())
+        logger.info(f"Yearly Billed AR {year}: ${billed_ar:,.2f} (status='Claim Created', {year_start.date()} to {year_end.date()})")
+
+        return billed_ar
+    except Exception as e:
+        logger.error(f"Error calculating yearly billed AR: {e}")
+        return 0.0
+
+
+def calculate_unbilled_ar_yearly(
+    df: pd.DataFrame,
+    balance_col: str,
+    status_col: str,
+    date_col: str,
+    year: int
+) -> float:
+    """
+    Calculate Unbilled AR for Yearly Report (Slide 5).
+
+    Unbilled AR = SUM(balance) WHERE visit_status != 'Claim Created'
+    (All other statuses besides 'Claim Created')
+    Date Range: Year start to today (Year-to-date)
+
+    Args:
+        df: DataFrame with balance, status, and date data
+        balance_col: Name of the balance column
+        status_col: Name of the status column (visit_status)
+        date_col: Name of the date column (visit_date)
+        year: Year (e.g., 2024)
+
+    Returns:
+        Sum of unbilled AR for the year-to-date
+    """
+    if balance_col not in df.columns or status_col not in df.columns or date_col not in df.columns:
+        return 0.0
+
+    try:
+        df_copy = df.copy()
+
+        # Convert date column
+        df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
+
+        # Calculate year date range
+        year_start = pd.Timestamp(year=year, month=1, day=1)
+        today = pd.Timestamp.now().normalize()
+        current_year = today.year
+
+        # Determine year end date
+        if year < current_year:
+            # Complete/past year: use Dec 31 of that year
+            year_end = pd.Timestamp(year=year, month=12, day=31)
+        else:
+            # Current year: use today (Year-to-date)
+            year_end = today
+
+        # Filter by status: NOT 'Claim Created' (all other statuses)
+        billed_status = 'claim created'
+        status_mask = ~(df_copy[status_col].astype(str).str.lower().str.strip() == billed_status)
+
+        # Filter by date: year start to year end (Dec 31 for past years, today for current year)
+        date_mask = (df_copy[date_col] >= year_start) & (df_copy[date_col] <= year_end)
+
+        # Combined filter
+        combined_mask = status_mask & date_mask
+
+        unbilled_ar = float(df_copy.loc[combined_mask, balance_col].sum())
+        logger.info(f"Yearly Unbilled AR {year}: ${unbilled_ar:,.2f} (status!='Claim Created', {year_start.date()} to {year_end.date()})")
+
+        return unbilled_ar
+    except Exception as e:
+        logger.error(f"Error calculating yearly unbilled AR: {e}")
+        return 0.0
 
 
 # ============================================================================

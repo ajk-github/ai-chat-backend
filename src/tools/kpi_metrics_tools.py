@@ -204,7 +204,9 @@ class KPIMetricsTools:
 
     def get_days_in_ar(self, table_name: Optional[str] = None) -> str:
         """
-        Calculate Days in AR (DAR).
+        Calculate Days in AR (DAR) using Weekly KPI logic.
+
+        Uses 365 days for full year data, or Year-to-date for current year only.
 
         Args:
             table_name: Optional table name
@@ -212,6 +214,8 @@ class KPIMetricsTools:
         Returns:
             Formatted response with DAR
         """
+        from src.utils.kpi_calculations import calculate_days_in_ar_weekly, _get_period_days_weekly
+
         df = self._get_data(table_name)
         if df is None:
             return "❌ No data available."
@@ -230,14 +234,15 @@ class KPIMetricsTools:
 
         ending_ar = float(df[balance_col].sum())
         total_charges = calculate_total_charges(df, charge_col)
-        _, _, period_days = get_date_range(df, date_col)
 
-        dar = calculate_days_in_ar(ending_ar, total_charges, period_days)
+        # Use new weekly DAR calculation
+        dar = calculate_days_in_ar_weekly(ending_ar, total_charges, df, date_col)
+        period_days = _get_period_days_weekly(df, date_col)
 
         return f"""**Days in AR:**
 - Ending AR: ${ending_ar:,.2f}
 - Total Charges: ${total_charges:,.2f}
-- Period Days: {period_days}
+- Period Days: {period_days} (365 for full year, or YTD for current year)
 - **DAR: {dar} Days**"""
 
     def get_ar_summary(self, table_name: Optional[str] = None) -> str:
