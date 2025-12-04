@@ -84,3 +84,7 @@ Formulas.md
 Formulas.txt
 REFACTORING_SUMMARY.md
 ARCHITECTURE.md
+
+# Development SQL files (not for production)
+dev-structure.sql
+dev-data.sql

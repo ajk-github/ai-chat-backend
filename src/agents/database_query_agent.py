@@ -164,32 +164,20 @@ class DatabaseQueryAgent:
         schema_parts = []
 
         for table_name in tables:
-            # Get schema from cache
-            schema = self.catalog.get_table_schema(table_name)
-
-            schema_parts.append(f"Table: {table_name}")
-            schema_parts.append("  Columns:")
-
-            for col in schema:
-                col_name = col.get("name", "")
-                col_type = col.get("full_type", col.get("type", ""))
-                nullable = col.get("nullable", True)
-                key = col.get("key", "")
-
-                col_desc = f"    - {col_name} ({col_type})"
-                
-                if key == "PRI":
-                    col_desc += " - PRIMARY KEY"
-                elif key == "MUL":
-                    col_desc += " - INDEXED"
-                elif key == "UNI":
-                    col_desc += " - UNIQUE"
-                
-                if not nullable:
-                    col_desc += " - NOT NULL"
-
-                schema_parts.append(col_desc)
-
+            # Use enhanced schema context if available
+            if hasattr(self.catalog, 'get_enhanced_schema_context'):
+                schema_text = self.catalog.get_enhanced_schema_context(table_name)
+                schema_parts.append(schema_text)
+            else:
+                # Fallback to basic schema
+                schema = self.catalog.get_table_schema(table_name)
+                schema_parts.append(f"Table: {table_name}")
+                schema_parts.append("  Columns:")
+                for col in schema:
+                    col_name = col.get("name", "")
+                    col_type = col.get("full_type", col.get("type", ""))
+                    schema_parts.append(f"    - {col_name} ({col_type})")
+            
             schema_parts.append("")
 
         schema_context = "\n".join(schema_parts)
@@ -282,36 +270,68 @@ The previous query failed. Common MySQL issues to avoid:
         # Build system prompt
         system_prompt = f"""You are a MySQL SQL expert. Convert the natural language question into a MySQL SQL query.
 
+CRITICAL: You MUST use ONLY the tables and columns listed in the schema below. Do NOT invent or guess table/column names.
+
 Available tables and schemas:
 {state['schema_context']}
 
-Rules:
-- Generate ONLY SELECT queries (read-only)
-- Use proper table and column names exactly as shown in the schema
-- Use backticks for table/column names if needed: `table_name`, `column_name`
-- Always include appropriate WHERE clauses to filter data
-- Use aggregations (COUNT, SUM, AVG, MAX, MIN, etc.) when appropriate
-- MySQL-specific syntax:
-  * Use DATE_FORMAT(date_col, '%Y-%m-%d') for date formatting
-  * Use YEAR(date_col), MONTH(date_col), DAY(date_col) for date extraction
-  * Use DATE(date_col) to extract date from datetime
-  * Use CONCAT() for string concatenation
-  * Use IFNULL() or COALESCE() for null handling
-- WHERE clause rules:
-  * You CANNOT use column aliases from SELECT in WHERE clause
-  * Use the full expression: WHERE YEAR(date_col) = 2025, NOT WHERE year = 2025
-  * Aliases can only be used in ORDER BY, HAVING, or subqueries
-- GROUP BY rules:
-  * MySQL allows aliases in GROUP BY, but all non-aggregated columns must be included
-  * When grouping by date parts, include the full expression or alias in GROUP BY
-  * Example: SELECT YEAR(date_col) AS year, COUNT(*) FROM table WHERE YEAR(date_col) = 2025 GROUP BY year
-- JOIN syntax:
-  * Use explicit JOIN syntax with ON clause
-  * Specify join conditions clearly
-  * Use appropriate join types (INNER, LEFT, RIGHT)
-- Return ONLY the SQL query without any explanation, markdown, or formatting
-- Do not include markdown code blocks or backticks around the SQL
-- The query should be executable as-is
+IMPORTANT RULES:
+1. **Table/Column Names**: Use EXACT table and column names from the schema above. Check spelling carefully.
+2. **Foreign Keys**: Use the foreign key relationships shown in the schema to create proper JOINs between tables.
+   - When a table shows "Foreign Keys: column -> other_table.other_column", use this for JOIN conditions
+   - Example: If schema shows "patient_id -> patients.id", use: JOIN patients ON table.patient_id = patients.id
+3. **Related Tables**: Use the "Related Tables" information to identify which tables can be joined together.
+4. **Primary Keys**: Use primary keys for joins when foreign keys are not explicitly defined.
+5. **Column Types**: Pay attention to column types (VARCHAR, INT, DATE, DATETIME, etc.) when writing conditions.
+6. **Only SELECT queries** (read-only)
+7. **Use backticks** for table/column names if needed: `table_name`, `column_name`
+8. **Always include appropriate WHERE clauses** to filter data
+9. **Use aggregations** (COUNT, SUM, AVG, MAX, MIN, etc.) when appropriate
+
+MySQL-specific syntax:
+- Use DATE_FORMAT(date_col, '%Y-%m-%d') for date formatting
+- Use YEAR(date_col), MONTH(date_col), DAY(date_col) for date extraction
+- Use DATE(date_col) to extract date from datetime
+- Use CONCAT() for string concatenation
+- Use IFNULL() or COALESCE() for null handling
+
+WHERE clause rules:
+- You CANNOT use column aliases from SELECT in WHERE clause
+- Use the full expression: WHERE YEAR(date_col) = 2025, NOT WHERE year = 2025
+- Aliases can only be used in ORDER BY, HAVING, or subqueries
+
+GROUP BY rules:
+- MySQL allows aliases in GROUP BY, but all non-aggregated columns must be included
+- When grouping by date parts, include the full expression or alias in GROUP BY
+
+JOIN syntax:
+- Use explicit JOIN syntax with ON clause
+- Use foreign key relationships from the schema to determine join conditions
+- Example: FROM table1 JOIN table2 ON table1.foreign_key_col = table2.primary_key_col
+- Use appropriate join types (INNER, LEFT, RIGHT)
+- **Common Join Patterns**: The schema shows "Common Joins" for each table - use these exact join conditions when joining those tables
+- **Common Join Chains**: 
+  * patient_visit -> patient_visit_cpt -> cpt_codes (most common)
+  * payment -> patient_visit_cpt -> patient_visit -> cpt_codes (for payment queries)
+
+COMMON BUSINESS RULES (from KPI queries):
+- **Always exclude deleted records**: Add "ISNULL(table.deleted_at)" or "table.deleted_at IS NULL" for patient_visit, patient_visit_cpt, cpt_codes, payment tables
+- **Exclude cancelled visits**: Add "pv.status != 12" when querying patient_visit
+- **Exclude test CPT codes**: Add "cc.cpt_code NOT IN ('00001', '00002', '00003', '90221', '90222')" when querying cpt_codes
+- **Exclude adjustment transactions**: Add "p.transaction_type NOT IN (9, 10)" when querying payment
+- **Common Calculations**:
+  * Charges: SUM(COALESCE(pvc.unit, 0) * COALESCE(pvc.cpt_amount, 0))
+  * Payments: SUM(p.amount)
+  * Visit Count: COUNT(*)
+- **Common Date Filters**:
+  * Current month: DATE(pv.visit_date) >= DATE_FORMAT(CURDATE(), '%Y-%m-01') AND DATE(pv.visit_date) <= LAST_DAY(CURDATE())
+  * Current quarter: YEAR(pv.visit_date) = YEAR(CURDATE()) AND QUARTER(pv.visit_date) = QUARTER(CURDATE())
+  * Current year: YEAR(pv.visit_date) = YEAR(CURDATE())
+  * Last week: DATE(pv.visit_date) >= DATE_SUB(CURDATE(), INTERVAL 7 DAY) AND DATE(pv.visit_date) <= CURDATE()
+
+Return ONLY the SQL query without any explanation, markdown, or formatting.
+Do not include markdown code blocks or backticks around the SQL.
+The query should be executable as-is.
 
 Previous conversation:
 {self._format_chat_history(state.get('chat_history', []))}
@@ -638,17 +658,25 @@ Provide a clear, concise answer that:
             return obj
 
     def _format_chat_history(self, chat_history: List[Dict[str, str]]) -> str:
-        """Format chat history for prompt."""
+        """Format chat history for context."""
         if not chat_history:
-            return "No previous conversation."
+            return "No previous conversation"
+
+        # Take last 5 exchanges (10 messages) - matching AR chat behavior
+        recent = chat_history[-10:]
 
         formatted = []
-        for msg in chat_history[-5:]:  # Last 5 messages
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            formatted.append(f"{role.capitalize()}: {content}")
 
-        return "\n".join(formatted)
+        for msg in recent:
+            role = msg.get("role", "")
+            content = msg.get("content", "")
+
+            if role == "user":
+                formatted.append(f"User: {content}")
+            elif role == "assistant":
+                formatted.append(f"Assistant: {content}")
+
+        return "\n".join(formatted) if formatted else "No previous conversation"
 
     # ===== Public API =====
 
