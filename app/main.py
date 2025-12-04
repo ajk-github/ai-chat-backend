@@ -709,11 +709,15 @@ async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
         try:
             messages = await asyncio.to_thread(fb.get_chat_messages, req.chat_id)
             # Format for agent: only include user and assistant messages (exclude system)
+            # Exclude the current message if it's already in the history (to avoid duplication)
             chat_history = [
                 {"role": msg["role"], "content": msg["content"]}
                 for msg in messages
                 if msg["role"] in ["user", "assistant"]
             ]
+            # Remove the last message if it's the current user message (already saved above)
+            if chat_history and chat_history[-1].get("role") == "user" and chat_history[-1].get("content") == req.message:
+                chat_history = chat_history[:-1]
         except Exception as fb_err:
             logging.getLogger(__name__).warning(f"Failed to retrieve chat history: {fb_err}")
             # Continue with empty history

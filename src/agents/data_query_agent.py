@@ -20,7 +20,7 @@ import pandas as pd
 
 from data_processing.duckdb_catalog import DuckDBCatalog
 from utils.sql_validator import SQLValidator
-from agents.weekly_report_tool import WeeklyReportTool
+from agents.telos_weekly_report_tool import TelosWeeklyReportTool
 
 logger = logging.getLogger(__name__)
 
@@ -106,8 +106,8 @@ class DataQueryAgent:
             pii_columns=["ssn", "password", "credit_card"]
         )
 
-        # Initialize weekly report tool
-        self.weekly_report_tool = WeeklyReportTool(duckdb_catalog)
+        # Initialize Telos weekly report tool
+        self.weekly_report_tool = TelosWeeklyReportTool(duckdb_catalog)
 
         # Load schema profiles
         self.schema_profiles = self._load_schema_profiles()
