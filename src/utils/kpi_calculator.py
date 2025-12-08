@@ -505,7 +505,7 @@ class KPICalculator:
         Calculate A/R in 31-60 day bucket.
 
         Formula: Sum of Balance where age is between 31-60 days
-        Age is calculated from bill_date to current date.
+        Age is calculated from visit_date to current date.
         """
         # Look for pre-calculated AR aging columns first
         ar_31_60_columns = ['ar_31_60', 'ar_31_60_days', 'ar_bucket_31_60', 'aging_31_60']
@@ -514,9 +514,9 @@ class KPICalculator:
             if col in self.df.columns:
                 return float(self.df[col].sum())
 
-        # Calculate from bill_date and balance columns
+        # Calculate from visit_date and balance columns
         date_col = None
-        date_columns = ['bill_date', 'billdate', 'billed_date', 'claim_date', 'submission_date']
+        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
         for col in date_columns:
             if col in self.df.columns:
                 date_col = col
@@ -550,7 +550,7 @@ class KPICalculator:
         Calculate A/R in 60-90 day bucket.
 
         Formula: Sum of Balance where age is between 60-90 days
-        Age is calculated from bill_date to current date.
+        Age is calculated from visit_date to current date.
         """
         # Look for pre-calculated AR aging columns first
         ar_60_plus_columns = ['ar_60_plus', 'ar_60+', 'ar_60_days', 'ar_over_60', 'ar_bucket_60_plus', 'aging_60_plus']
@@ -559,9 +559,9 @@ class KPICalculator:
             if col in self.df.columns:
                 return float(self.df[col].sum())
 
-        # Calculate from bill_date and balance columns
+        # Calculate from visit_date and balance columns
         date_col = None
-        date_columns = ['bill_date', 'billdate', 'billed_date', 'claim_date', 'submission_date']
+        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
         for col in date_columns:
             if col in self.df.columns:
                 date_col = col
@@ -914,8 +914,8 @@ class KPICalculator:
         Week 1: Month start to first Monday
         Week 2+: Tuesday to Monday (7 days, may be partial for last week)
 
-        Both Forecast and Actuals use Visit Created Date column.
-        If column not available, shows "visit created date not available" for all metrics.
+        Both Forecast and Actuals use Transaction Date column.
+        If column not available, shows "transaction date not available" for all metrics.
 
         Args:
             company_name: Name of the company for the report
@@ -928,16 +928,16 @@ class KPICalculator:
         logger.info(f"Generating weekly breakdown report for {company_name}...")
 
         try:
-            # Step 1: Check for Visit Created Date column (REQUIRED for both forecast and actuals)
-            created_date_col = None
-            created_date_columns = ['visit_created_date', 'visitcreateddate', 'created_date', 'date_created']
-            for col in created_date_columns:
+            # Step 1: Check for Transaction Date column (REQUIRED for both forecast and actuals)
+            transaction_date_col = None
+            transaction_date_columns = ['transaction_date', 'transactiondate', 'payment_date', 'date_created']
+            for col in transaction_date_columns:
                 if col in self.df.columns:
-                    created_date_col = col
+                    transaction_date_col = col
                     break
 
-            if created_date_col is None:
-                logger.warning("Visit Created Date column not found - forecast and actuals will not be available")
+            if transaction_date_col is None:
+                logger.warning("Transaction Date column not found - forecast and actuals will not be available")
                 # Still need to determine year/month for week structure
                 # Try to get from visit_date as fallback for date detection only
                 visit_date_col = None
@@ -972,10 +972,10 @@ class KPICalculator:
                         "week_start": week_info['start_date'].strftime('%Y-%m-%d'),
                         "week_end": week_info['end_date'].strftime('%Y-%m-%d'),
                         "days": week_info['days'],
-                        "forecasted_visits": "visit created date not available",
-                        "actual_visits": "visit created date not available",
-                        "forecasted_collections": "visit created date not available",
-                        "actual_collections": "visit created date not available",
+                        "forecasted_visits": "transaction date not available",
+                        "actual_visits": "transaction date not available",
+                        "forecasted_collections": "transaction date not available",
+                        "actual_collections": "transaction date not available",
                     }
 
                 return {
@@ -984,15 +984,15 @@ class KPICalculator:
                     "month": month,
                     "month_name": datetime(year, month, 1).strftime('%B'),
                     "generated_at": datetime.now().isoformat(),
-                    "avg_daily_visits": "visit created date not available",
-                    "avg_daily_collections": "visit created date not available",
+                    "avg_daily_visits": "transaction date not available",
+                    "avg_daily_collections": "transaction date not available",
                     "weeks": weekly_data
                 }
 
-            # Parse Visit Created Date
+            # Parse Transaction Date
             df_copy = self.df.copy()
-            df_copy[created_date_col] = pd.to_datetime(df_copy[created_date_col], errors='coerce')
-            df_copy = df_copy[df_copy[created_date_col].notna()]
+            df_copy[transaction_date_col] = pd.to_datetime(df_copy[transaction_date_col], errors='coerce')
+            df_copy = df_copy[df_copy[transaction_date_col].notna()]
 
             if df_copy.empty:
                 return {
@@ -1000,13 +1000,13 @@ class KPICalculator:
                     "year": year,
                     "month": month,
                     "generated_at": datetime.now().isoformat(),
-                    "error": "No valid dates found in Visit Created Date column.",
+                    "error": "No valid dates found in Transaction Date column.",
                     "weeks": {}
                 }
 
-            # Auto-detect latest year/month if not specified (using visit_created_date)
+            # Auto-detect latest year/month if not specified (using transaction_date)
             if year is None or month is None:
-                latest_date = df_copy[created_date_col].max()
+                latest_date = df_copy[transaction_date_col].max()
                 year = latest_date.year
                 month = latest_date.month
                 logger.info(f"Auto-detected latest month: {year}-{month:02d}")
@@ -1015,7 +1015,7 @@ class KPICalculator:
             prev_3_months = self._get_previous_3_complete_months(year, month)
             logger.info(f"Using previous 3 complete months for forecast: {prev_3_months}")
 
-            # Filter data for previous 3 complete months (using Visit Created Date)
+            # Filter data for previous 3 complete months (using Transaction Date)
             df_three_months = pd.DataFrame()
             total_days_in_3_months = 0
 
@@ -1028,8 +1028,8 @@ class KPICalculator:
                 month_end = datetime(prev_year, prev_month, days_in_month)
 
                 month_data = df_copy[
-                    (df_copy[created_date_col] >= month_start) &
-                    (df_copy[created_date_col] <= month_end)
+                    (df_copy[transaction_date_col] >= month_start) &
+                    (df_copy[transaction_date_col] <= month_end)
                 ]
                 df_three_months = pd.concat([df_three_months, month_data])
 
@@ -1063,16 +1063,16 @@ class KPICalculator:
                 week_end = week_info['end_date']
                 days_in_week = week_info['days']
 
-                # Cumulative forecast (using Visit Created Date)
+                # Cumulative forecast (using Transaction Date)
                 cumulative_days += days_in_week
                 cumulative_forecasted_visits = round(avg_daily_visits * cumulative_days)
                 cumulative_forecasted_collections = avg_daily_collections * cumulative_days
 
-                # Actual values for this week (using Visit Created Date)
+                # Actual values for this week (using Transaction Date)
                 week_df = df_copy[
-                    (df_copy[created_date_col].notna()) &
-                    (df_copy[created_date_col] >= week_start) &
-                    (df_copy[created_date_col] <= week_end)
+                    (df_copy[transaction_date_col].notna()) &
+                    (df_copy[transaction_date_col] >= week_start) &
+                    (df_copy[transaction_date_col] <= week_end)
                 ]
 
                 actual_visits = len(week_df)
