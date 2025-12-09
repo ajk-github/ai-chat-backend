@@ -21,6 +21,7 @@ import pandas as pd
 from data_processing.duckdb_catalog import DuckDBCatalog
 from utils.sql_validator import SQLValidator
 from agents.telos_weekly_report_tool import TelosWeeklyReportTool
+from tools.denial_analysis_tool import DenialAnalysisTool
 
 logger = logging.getLogger(__name__)
 
@@ -59,6 +60,10 @@ class AgentState(TypedDict):
     # Weekly report
     is_weekly_report: bool
     company_name: Optional[str]
+
+    # Denial analysis
+    is_denial_analysis: bool
+    use_transaction_date: bool
 
 
 # ===== Agent Class =====
@@ -109,6 +114,9 @@ class DataQueryAgent:
         # Initialize Telos weekly report tool
         self.weekly_report_tool = TelosWeeklyReportTool(duckdb_catalog)
 
+        # Initialize denial analysis tool
+        self.denial_analysis_tool = DenialAnalysisTool(duckdb_catalog)
+
         # Load schema profiles
         self.schema_profiles = self._load_schema_profiles()
 
@@ -142,6 +150,7 @@ class DataQueryAgent:
         # Add nodes
         workflow.add_node("detect_intent", self.detect_intent_node)
         workflow.add_node("handle_weekly_report", self.handle_weekly_report_node)
+        workflow.add_node("handle_denial_analysis", self.handle_denial_analysis_node)
         workflow.add_node("load_schema", self.load_schema_node)
         workflow.add_node("generate_sql", self.generate_sql_node)
         workflow.add_node("validate_sql", self.validate_sql_node)
@@ -158,11 +167,13 @@ class DataQueryAgent:
             self.route_by_intent,
             {
                 "weekly_report": "handle_weekly_report",
+                "denial_analysis": "handle_denial_analysis",
                 "normal_query": "load_schema"
             }
         )
 
         workflow.add_edge("handle_weekly_report", END)
+        workflow.add_edge("handle_denial_analysis", END)
         workflow.add_edge("load_schema", "generate_sql")
 
         workflow.add_conditional_edges(
@@ -202,7 +213,7 @@ class DataQueryAgent:
     # ===== Nodes =====
 
     def detect_intent_node(self, state: AgentState) -> AgentState:
-        """Detect if the question is asking for a weekly report."""
+        """Detect if the question is asking for a weekly report or denial analysis."""
         logger.info("Detecting intent...")
 
         question = state["question"].lower()
@@ -218,8 +229,23 @@ class DataQueryAgent:
             "performance report"
         ]
 
+        # Check for denial analysis patterns
+        denial_patterns = [
+            "/denial",
+            "denial analysis",
+            "denial report",
+            "denied claims",
+            "show me denials",
+            "denial metrics",
+            "claims denial",
+            "denial percentage"
+        ]
+
         is_weekly_report = any(pattern in question for pattern in weekly_patterns)
+        is_denial_analysis = any(pattern in question for pattern in denial_patterns)
+
         state["is_weekly_report"] = is_weekly_report
+        state["is_denial_analysis"] = is_denial_analysis
 
         # Extract company name if present
         company_name = "Company"  # Default
@@ -246,7 +272,11 @@ class DataQueryAgent:
 
         state["company_name"] = company_name
 
-        logger.info(f"Intent detection: is_weekly_report={is_weekly_report}, company={company_name}")
+        # Check for --transaction flag in denial analysis
+        use_transaction_date = "--transaction" in question
+        state["use_transaction_date"] = use_transaction_date
+
+        logger.info(f"Intent detection: is_weekly_report={is_weekly_report}, is_denial_analysis={is_denial_analysis}, company={company_name}, use_transaction_date={use_transaction_date}")
 
         return state
 
@@ -270,6 +300,34 @@ class DataQueryAgent:
         except Exception as e:
             logger.error(f"Error generating weekly report: {e}")
             state["answer"] = f"❌ Error generating weekly report: {str(e)}"
+            state["execution_success"] = False
+
+        return state
+
+    def handle_denial_analysis_node(self, state: AgentState) -> AgentState:
+        """Handle denial analysis report generation."""
+        use_transaction = state.get("use_transaction_date", False)
+        date_type = "transaction_date" if use_transaction else "visit_date"
+        logger.info(f"Generating denial analysis report for {state.get('company_name', 'Company')} using {date_type}...")
+
+        try:
+            # Generate denial analysis report
+            report = self.denial_analysis_tool.generate_report(
+                company_name=state.get("company_name", "Company"),
+                use_transaction_date=use_transaction
+            )
+
+            state["answer"] = report
+            state["execution_success"] = True
+            state["metadata"] = {
+                "report_type": "denial_analysis",
+                "company": state.get("company_name", "Company"),
+                "date_type": date_type
+            }
+
+        except Exception as e:
+            logger.error(f"Error generating denial analysis report: {e}")
+            state["answer"] = f"❌ Error generating denial analysis report: {str(e)}"
             state["execution_success"] = False
 
         return state
@@ -686,6 +744,8 @@ Provide a clear, concise answer that:
         """Route based on detected intent."""
         if state.get("is_weekly_report", False):
             return "weekly_report"
+        if state.get("is_denial_analysis", False):
+            return "denial_analysis"
         return "normal_query"
 
     def check_sql_generated(self, state: AgentState) -> str:
