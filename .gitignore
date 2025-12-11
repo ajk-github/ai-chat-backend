@@ -70,6 +70,7 @@ logs/*.jsonl
 
 # Data Storage (user data, processed files)
 data/
+dbcontext/
 
 # Cache
 .cache/

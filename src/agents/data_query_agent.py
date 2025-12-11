@@ -63,7 +63,6 @@ class AgentState(TypedDict):
 
     # Denial analysis
     is_denial_analysis: bool
-    use_transaction_date: bool
 
 
 # ===== Agent Class =====
@@ -272,11 +271,7 @@ class DataQueryAgent:
 
         state["company_name"] = company_name
 
-        # Check for --transaction flag in denial analysis
-        use_transaction_date = "--transaction" in question
-        state["use_transaction_date"] = use_transaction_date
-
-        logger.info(f"Intent detection: is_weekly_report={is_weekly_report}, is_denial_analysis={is_denial_analysis}, company={company_name}, use_transaction_date={use_transaction_date}")
+        logger.info(f"Intent detection: is_weekly_report={is_weekly_report}, is_denial_analysis={is_denial_analysis}, company={company_name}")
 
         return state
 
@@ -306,23 +301,19 @@ class DataQueryAgent:
 
     def handle_denial_analysis_node(self, state: AgentState) -> AgentState:
         """Handle denial analysis report generation."""
-        use_transaction = state.get("use_transaction_date", False)
-        date_type = "transaction_date" if use_transaction else "visit_date"
-        logger.info(f"Generating denial analysis report for {state.get('company_name', 'Company')} using {date_type}...")
+        logger.info(f"Generating denial analysis report for {state.get('company_name', 'Company')}...")
 
         try:
-            # Generate denial analysis report
+            # Generate denial analysis report (shows both visit_date and transaction_date)
             report = self.denial_analysis_tool.generate_report(
-                company_name=state.get("company_name", "Company"),
-                use_transaction_date=use_transaction
+                company_name=state.get("company_name", "Company")
             )
 
             state["answer"] = report
             state["execution_success"] = True
             state["metadata"] = {
                 "report_type": "denial_analysis",
-                "company": state.get("company_name", "Company"),
-                "date_type": date_type
+                "company": state.get("company_name", "Company")
             }
 
         except Exception as e:

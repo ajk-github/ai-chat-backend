@@ -372,22 +372,19 @@ class DenialAnalysisTool:
             logger.error(f"Error getting denial metrics: {e}", exc_info=True)
             return {"error": str(e)}
 
-    def generate_report(self, company_name: str = "Company", table_name: Optional[str] = None,
-                       use_transaction_date: bool = False) -> str:
+    def generate_report(self, company_name: str = "Company", table_name: Optional[str] = None) -> str:
         """
-        Generate complete denial analysis report (all slides) using DuckDB SQL queries.
+        Generate complete denial analysis report showing both visit date and transaction date analyses.
 
         Args:
             company_name: Name of the company for the report header
             table_name: Specific table to query (if None, uses first available table)
-            use_transaction_date: If True, use transaction_date instead of visit_date
 
         Returns:
-            Formatted denial analysis report with all slides as text
+            Formatted denial analysis report with both date types as text
         """
         try:
-            date_type = "transaction_date" if use_transaction_date else "visit_date"
-            logger.info(f"Generating complete denial analysis report for {company_name} using {date_type}...")
+            logger.info(f"Generating complete denial analysis report for {company_name}...")
 
             # Get all available tables
             tables = self.catalog.list_tables()
@@ -415,16 +412,9 @@ Available columns in table '{target_table}':
 Looking for columns like: 'Denial Code', 'denial_code', 'denialcode', etc.
 Please ensure your data has a denial code column."""
 
-            # Find date column based on flag
-            if use_transaction_date:
-                date_col = self._find_transaction_date_column(target_table)
-                date_label = "Transaction Date"
-            else:
-                date_col = self._find_visit_date_column(target_table)
-                date_label = "Visit Date"
-
-            if not date_col:
-                return f"❌ {date_label} column not found - cannot generate time-based denial reports"
+            # Find both date columns
+            visit_date_col = self._find_visit_date_column(target_table)
+            transaction_date_col = self._find_transaction_date_column(target_table)
 
             # Find charges column (optional)
             charges_col = self._find_charges_column(target_table)
@@ -432,48 +422,155 @@ Please ensure your data has a denial code column."""
             if not charges_col:
                 logger.warning("Charges column not found - will show $0.00 for denied charges")
 
-            # ===== SLIDE 1: All Time =====
-            # Get denial metrics using SQL queries
-            metrics = self._get_denial_metrics(target_table, denial_col, charges_col)
-
-            if "error" in metrics:
-                return f"❌ Error calculating denial metrics: {metrics.get('error')}"
-
-            # Format Slide 1 as a markdown table
-            slide1_output = f"\n{'='*60}\n"
-            slide1_output += f"SLIDE 1: {company_name} - Denied Claims (All time)\n"
-            slide1_output += f"{'='*60}\n\n"
+            # Build the report header
+            output = f"\n{'='*80}\n"
+            output += f"{company_name} - DENIAL ANALYSIS REPORT\n"
+            output += f"{'='*80}\n\n"
 
             if not charges_col:
-                slide1_output += "⚠️  WARNING: Charges column not found\n\n"
+                output += "⚠️  WARNING: Charges column not found\n\n"
 
-            # Create markdown table
-            slide1_output += "| Metric | Value |\n"
-            slide1_output += "|--------|-------|\n"
-            slide1_output += f"| Count of Denied Claims | {metrics['denied_count']:,} |\n"
-            slide1_output += f"| Total Claims | {metrics['total_count']:,} |\n"
-            slide1_output += f"| Denial Percentage | {metrics['denial_percentage']:.2f}% |\n"
-            slide1_output += f"| Total Denied Charges | ${metrics['denied_charges']:,.2f} |\n"
-            slide1_output += f"\n{'='*60}\n"
+            # ===== BY VISIT DATE =====
+            output += self._generate_compact_table(target_table, denial_col, charges_col, visit_date_col, "Visit Date")
 
-            # ===== SLIDE 2: Year over Year =====
-            slide2_output = self.generate_slide_2_year_over_year(company_name, target_table, date_col, date_label)
+            output += "\n\n"
 
-            # ===== SLIDE 3: Current Month =====
-            slide3_output = self.generate_slide_3_current_month(company_name, target_table, date_col, date_label)
+            # ===== BY TRANSACTION DATE =====
+            output += self._generate_compact_table(target_table, denial_col, charges_col, transaction_date_col, "Transaction Date")
 
-            # ===== SLIDE 4: Last Week =====
-            slide4_output = self.generate_slide_4_last_week(company_name, target_table, date_col, date_label)
-
-            # Combine all slides
-            combined_output = f"{slide1_output}\n\n{slide2_output}\n\n{slide3_output}\n\n{slide4_output}"
-
-            logger.info(f"Successfully generated complete denial analysis report for {company_name} using {date_type}")
-            return combined_output
+            logger.info(f"Successfully generated complete denial analysis report for {company_name}")
+            return output
 
         except Exception as e:
             logger.error(f"Error generating denial analysis report: {e}", exc_info=True)
             return f"❌ Error generating denial analysis report: {str(e)}"
+
+    def _generate_compact_table(self, table_name: str, denial_col: str, charges_col: Optional[str],
+                                 date_col: Optional[str], date_label: str) -> str:
+        """
+        Generate a compact table showing all timeframes (All time, Current year, Current Month, Last Week).
+
+        Args:
+            table_name: Name of the table
+            denial_col: Name of the denial code column
+            charges_col: Name of the charges column (can be None)
+            date_col: Name of the date column to use (can be None)
+            date_label: Label for the date type (e.g., "Visit Date" or "Transaction Date")
+
+        Returns:
+            Formatted table as markdown string
+        """
+        output = f"**By {date_label}:**\n\n"
+
+        if not date_col:
+            output += f"❌ {date_label} column not found - cannot generate time-based analysis\n"
+            return output
+
+        # Get metrics for all timeframes
+        # 1. All time
+        all_time_metrics = self._get_denial_metrics(table_name, denial_col, charges_col)
+
+        # 2. Current year
+        current_year_info = self._get_current_year_info(table_name, date_col)
+        if current_year_info:
+            current_year_metrics = self._get_denial_metrics_for_year(
+                table_name, denial_col, charges_col, date_col, current_year_info["year"]
+            )
+        else:
+            current_year_metrics = None
+
+        # 3. Current month
+        current_month_info = self._get_current_month_info(table_name, date_col)
+        if current_month_info:
+            current_month_metrics = self._get_denial_metrics_for_current_month(
+                table_name, denial_col, charges_col, date_col,
+                current_month_info["year"], current_month_info["month"]
+            )
+        else:
+            current_month_metrics = None
+
+        # 4. Last week
+        last_week_info = self._get_last_week_info(table_name, date_col)
+        if last_week_info:
+            last_week_metrics = self._get_denial_metrics_for_last_week(
+                table_name, denial_col, charges_col, date_col,
+                last_week_info["year"], last_week_info["week_number"]
+            )
+        else:
+            last_week_metrics = None
+
+        # Create compact table
+        output += "| Timeframe | Count | % of total | Charges |\n"
+        output += "|-----------|-------|------------|----------|\n"
+
+        # Row 1: All time
+        if all_time_metrics and "error" not in all_time_metrics:
+            output += f"| All time | {all_time_metrics['denied_count']:,} | {all_time_metrics['denial_percentage']:.2f}% | ${all_time_metrics['denied_charges']:,.2f} |\n"
+        else:
+            output += "| All time | N/A | N/A | N/A |\n"
+
+        # Row 2: Current year
+        if current_year_metrics and "error" not in current_year_metrics:
+            output += f"| Current year | {current_year_metrics['denied_count']:,} | {current_year_metrics['denial_percentage']:.2f}% | ${current_year_metrics['denied_charges']:,.2f} |\n"
+        else:
+            output += "| Current year | N/A | N/A | N/A |\n"
+
+        # Row 3: Current Month
+        if current_month_metrics and "error" not in current_month_metrics:
+            output += f"| Current Month | {current_month_metrics['denied_count']:,} | {current_month_metrics['denial_percentage']:.2f}% | ${current_month_metrics['denied_charges']:,.2f} |\n"
+        else:
+            output += "| Current Month | N/A | N/A | N/A |\n"
+
+        # Row 4: Last Week
+        if last_week_metrics and "error" not in last_week_metrics:
+            output += f"| Last Week | {last_week_metrics['denied_count']:,} | {last_week_metrics['denial_percentage']:.2f}% | ${last_week_metrics['denied_charges']:,.2f} |\n"
+        else:
+            output += "| Last Week | N/A | N/A | N/A |\n"
+
+        return output
+
+    def _get_current_year_info(self, table_name: str, date_col: str) -> Optional[Dict[str, Any]]:
+        """
+        Get current year information based on the latest date in the data.
+
+        Args:
+            table_name: Name of the table
+            date_col: Name of the date column
+
+        Returns:
+            Dictionary with year info, or None if error
+        """
+        try:
+            # Get the latest date in the data
+            query = f'''
+                SELECT MAX("{date_col}") as max_date
+                FROM "{table_name}"
+                WHERE "{date_col}" IS NOT NULL
+            '''
+            result = self.catalog.execute_query(query, max_rows=1, timeout=30)
+
+            if result.get("success") and result.get("rows"):
+                max_date = result.get("rows")[0].get("max_date")
+                if max_date:
+                    # Get year from max date
+                    year_query = f'''
+                        SELECT YEAR("{date_col}") as year
+                        FROM "{table_name}"
+                        WHERE "{date_col}" = '{max_date}'
+                        LIMIT 1
+                    '''
+                    year_result = self.catalog.execute_query(year_query, max_rows=1, timeout=30)
+
+                    if year_result.get("success") and year_result.get("rows"):
+                        year = year_result.get("rows")[0].get("year")
+                        logger.info(f"Current year determined as: {year} (based on max date: {max_date})")
+                        return {"year": year, "max_date": max_date}
+
+            return None
+
+        except Exception as e:
+            logger.error(f"Error getting current year info: {e}")
+            return None
 
     def _get_available_years(self, table_name: str, visit_date_col: str) -> List[int]:
         """
@@ -1127,7 +1224,7 @@ Please ensure your data has a denial code column."""
         return """Generate denial analysis report with comprehensive denial metrics.
 
         Use this tool when the user asks for:
-        - "/denial"
+        - "/denial" or "/denials"
         - "denial analysis"
         - "denial report"
         - "denied claims"
@@ -1139,35 +1236,32 @@ Please ensure your data has a denial code column."""
         - company_name: Name of the company (default: "Company")
         - table_name: Optional specific table name (default: first table)
 
-        Returns formatted denial analysis report with FOUR slides:
+        Returns formatted denial analysis report with TWO sections:
 
-        SLIDE 1 - DENIED CLAIMS (ALL TIME):
-        1. Count of Denied Claims - Total number of claims with a denial code
-        2. Total Claims Count - Total number of all claims
-        3. Denial Percentage - Percentage of claims that were denied
-        4. Total Denied Claims Charges - Sum of charges for all denied claims
+        SECTION 1 - BY VISIT DATE:
+        Shows denial metrics across different timeframes based on when the service occurred:
+        - All time
+        - Current year
+        - Current Month
+        - Last Week
 
-        SLIDE 2 - DENIED CLAIMS (YEAR OVER YEAR):
-        - Same metrics as Slide 1, broken down by year
-        - Years displayed as columns in the table
-        - Automatically detects all years in the data
+        Each timeframe shows: Count | % of total | Charges
 
-        SLIDE 3 - DENIED CLAIMS (CURRENT MONTH):
-        - Same metrics as Slide 1, for current month only
-        - Current month determined by latest date in visit_date column
-        - Shows month-to-date data
+        SECTION 2 - BY TRANSACTION DATE:
+        Shows the same metrics based on when the payment/transaction was posted:
+        - All time
+        - Current year
+        - Current Month
+        - Last Week
 
-        SLIDE 4 - DENIED CLAIMS (LAST WEEK):
-        - Same metrics as Slide 1, for last week only
-        - Last week = week containing the latest date (most recent week with data)
-        - Shows week number and date range
+        Each timeframe shows: Count | % of total | Charges
 
         Denial Logic (SIMPLE):
-        - A claim is DENIED if denial_code column is NOT empty (has any value)
-        - A claim is NOT DENIED if denial_code is empty or NULL
+        - A claim is DENIED if denial_code column is NOT empty (has any value except 'nan')
+        - A claim is NOT DENIED if denial_code is empty, NULL, or 'nan'
 
         Uses DuckDB SQL queries for accurate counting.
-        Shows top denial codes and distribution for diagnostics.
+        Compact table format for easy comparison across timeframes.
         """
 
 
