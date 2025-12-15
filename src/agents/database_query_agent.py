@@ -30,6 +30,11 @@ class AgentState(TypedDict):
     question: str
     chat_history: List[Dict[str, str]]
 
+    # Clarification (NEW for better UX)
+    needs_clarification: bool
+    clarification_question: Optional[str]
+    ambiguity_type: Optional[str]
+
     # Schema context
     available_tables: List[str]
     schema_context: str
@@ -96,6 +101,15 @@ class DatabaseQueryAgent:
             pii_columns=["ssn", "password", "credit_card"]
         )
 
+        # Load few-shot examples for better SQL generation
+        self.query_examples = self._load_query_examples()
+
+        # Load table relationships for multi-table queries
+        self.relationships = self._load_relationships()
+
+        # Load business rules and domain knowledge
+        self.business_rules = self._load_business_rules()
+
         # Build graph
         self.graph = self._build_graph()
 
@@ -105,6 +119,7 @@ class DatabaseQueryAgent:
 
         # Add nodes
         workflow.add_node("load_schema", self.load_schema_node)
+        workflow.add_node("check_clarification", self.check_clarification_node)
         workflow.add_node("generate_sql", self.generate_sql_node)
         workflow.add_node("validate_sql", self.validate_sql_node)
         workflow.add_node("execute_query", self.execute_query_node)
@@ -114,7 +129,18 @@ class DatabaseQueryAgent:
         # Define edges
         workflow.set_entry_point("load_schema")
 
-        workflow.add_edge("load_schema", "generate_sql")
+        # After loading schema, check if clarification is needed
+        workflow.add_edge("load_schema", "check_clarification")
+
+        # Route based on clarification check
+        workflow.add_conditional_edges(
+            "check_clarification",
+            self.route_after_clarification,
+            {
+                "clarify": END,  # Return clarification question to user
+                "proceed": "generate_sql"  # Continue with SQL generation
+            }
+        )
 
         workflow.add_conditional_edges(
             "generate_sql",
@@ -149,6 +175,265 @@ class DatabaseQueryAgent:
         workflow.add_edge("handle_error", END)
 
         return workflow.compile()
+
+    # ===== Enhancement Loading Methods =====
+
+    def _load_query_examples(self) -> List[Dict[str, Any]]:
+        """Load few-shot query examples from JSON file."""
+        examples = []
+
+        # Look for MySQL examples file in schemas directory
+        examples_path = Path(__file__).parent.parent.parent / "schemas" / "query_examples_mysql.json"
+
+        # Fallback to DuckDB examples if MySQL-specific file doesn't exist
+        if not examples_path.exists():
+            examples_path = Path(__file__).parent.parent.parent / "schemas" / "query_examples_duckdb.json"
+            logger.warning("MySQL examples not found, using DuckDB examples as fallback")
+
+        if not examples_path.exists():
+            logger.warning(f"Query examples file not found at {examples_path}")
+            return examples
+
+        try:
+            with open(examples_path, 'r') as f:
+                data = json.load(f)
+                examples = data.get("examples", [])
+                logger.info(f"Loaded {len(examples)} query examples for MySQL agent")
+        except Exception as e:
+            logger.error(f"Error loading query examples: {e}")
+
+        return examples
+
+    def _get_relevant_examples(self, question: str, n: int = 3) -> List[Dict[str, Any]]:
+        """
+        Find relevant query examples based on keyword matching.
+
+        Args:
+            question: User's natural language question
+            n: Number of examples to return
+
+        Returns:
+            List of relevant examples
+        """
+        if not self.query_examples:
+            return []
+
+        question_lower = question.lower()
+
+        # Score each example
+        scored_examples = []
+        for ex in self.query_examples:
+            score = 0
+
+            # Check if question words appear in example question or tags
+            for word in question_lower.split():
+                # Skip common words
+                if word in ['the', 'a', 'an', 'is', 'are', 'was', 'were', 'what', 'how', 'show', 'me']:
+                    continue
+
+                if word in ex["question"].lower():
+                    score += 2
+                if word in " ".join(ex.get("tags", [])):
+                    score += 1
+
+            # Boost CRITICAL examples if they're relevant
+            if "CRITICAL" in ex.get("tags", []) and score > 0:
+                score += 3
+
+            if score > 0:
+                scored_examples.append((score, ex))
+
+        # Return top N examples
+        scored_examples.sort(reverse=True, key=lambda x: x[0])
+        return [ex for score, ex in scored_examples[:n]]
+
+    def _load_relationships(self) -> Dict[str, Any]:
+        """Load table relationships from JSON file."""
+        relationships = {}
+
+        # Look for relationships file in schemas directory
+        rel_path = Path(__file__).parent.parent.parent / "schemas" / "relationships.json"
+
+        if not rel_path.exists():
+            logger.warning(f"Relationships file not found at {rel_path}")
+            return relationships
+
+        try:
+            with open(rel_path, 'r') as f:
+                data = json.load(f)
+                relationships = data
+                logger.info(f"Loaded {len(data.get('tables', {}))} table relationships for MySQL agent")
+        except Exception as e:
+            logger.error(f"Error loading relationships: {e}")
+
+        return relationships
+
+    def _get_relationship_context(self, tables: List[str]) -> str:
+        """
+        Get relationship context for tables mentioned in the question.
+
+        Args:
+            tables: List of table names potentially involved in the query
+
+        Returns:
+            Formatted relationship context string
+        """
+        if not self.relationships or not tables:
+            return ""
+
+        context_parts = []
+        table_data = self.relationships.get("tables", {})
+        join_paths = self.relationships.get("common_join_paths", [])
+
+        # Add relationship info for each table
+        for table in tables:
+            if table in table_data:
+                t_info = table_data[table]
+
+                # Show foreign keys (how this table joins to others)
+                if t_info.get("foreign_keys"):
+                    fks = []
+                    for col, fk_info in t_info["foreign_keys"].items():
+                        fks.append(f"{col} → {fk_info['references']}")
+                    if fks:
+                        context_parts.append(f"{table} joins to: {', '.join(fks)}")
+
+        # Add relevant common join paths
+        relevant_joins = [jp for jp in join_paths if any(t in jp.get("tables", []) for t in tables)]
+        if relevant_joins:
+            context_parts.append("\nCommon Join Patterns:")
+            for jp in relevant_joins[:3]:  # Show top 3 relevant joins
+                context_parts.append(f"  - {jp['description']}")
+                context_parts.append(f"    SQL: {jp['sql_template']}")
+
+        return "\n".join(context_parts) if context_parts else ""
+
+    def _load_business_rules(self) -> Dict[str, Any]:
+        """Load business rules and domain knowledge from JSON file."""
+        rules = {}
+
+        # Look for business rules file in schemas directory
+        rules_path = Path(__file__).parent.parent.parent / "schemas" / "business_rules.json"
+
+        if not rules_path.exists():
+            logger.warning(f"Business rules file not found at {rules_path}")
+            return rules
+
+        try:
+            with open(rules_path, 'r') as f:
+                data = json.load(f)
+                rules = data
+                logger.info(f"Loaded business rules with {len(data.get('kpi_definitions', {}))} KPI definitions for MySQL agent")
+        except Exception as e:
+            logger.error(f"Error loading business rules: {e}")
+
+        return rules
+
+    def _get_business_context(self, question: str) -> str:
+        """
+        Get relevant business rules context based on the question.
+
+        Args:
+            question: User's natural language question
+
+        Returns:
+            Formatted business rules context string
+        """
+        if not self.business_rules:
+            return ""
+
+        context_parts = []
+        question_lower = question.lower()
+
+        # Check if question involves KPIs
+        kpi_defs = self.business_rules.get("kpi_definitions", {})
+        for kpi_name, kpi_info in kpi_defs.items():
+            if any(word in question_lower for word in kpi_name.lower().split()):
+                context_parts.append(f"KPI: {kpi_name}")
+                context_parts.append(f"  Formula: {kpi_info['formula']}")
+                # Adapt SQL template for MySQL if needed
+                sql_template = kpi_info['sql_template']
+                # MySQL uses same syntax for most aggregates
+                context_parts.append(f"  SQL: {sql_template}")
+
+        # Check if question involves date filtering
+        if any(word in question_lower for word in ['this month', 'last month', 'this year', 'current', 'ytd', 'last week']):
+            common_filters = self.business_rules.get("common_filters", {})
+            context_parts.append("\nCommon Date Filters:")
+            for filter_name, filter_info in list(common_filters.items())[:3]:
+                if isinstance(filter_info, dict):
+                    # Convert DuckDB syntax to MySQL if needed
+                    sql = filter_info.get('sql', '')
+                    # Basic conversion: DATE_TRUNC → DATE_FORMAT, INTERVAL syntax similar
+                    context_parts.append(f"  {filter_name}: {sql}")
+
+        return "\n".join(context_parts) if context_parts else ""
+
+    def _detect_ambiguity(self, question: str, schema_context: str) -> Dict[str, Any]:
+        """
+        Detect if the question is ambiguous and needs clarification.
+
+        Returns:
+            Dict with 'needs_clarification', 'question', and 'type' keys
+        """
+        question_lower = question.lower()
+
+        # Pattern 1: Missing date range for aggregate queries
+        has_aggregate = any(word in question_lower for word in [
+            'total', 'sum', 'count', 'average', 'avg', 'how many', 'revenue', 'charges'
+        ])
+        has_date_filter = any(word in question_lower for word in [
+            '2024', '2025', 'this month', 'last month', 'this year', 'last year',
+            'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+            'september', 'october', 'november', 'december', 'week', 'quarter', 'ytd'
+        ])
+
+        if has_aggregate and not has_date_filter:
+            return {
+                "needs_clarification": True,
+                "question": "For what time period would you like this analysis?\n\nOptions:\n• This month\n• Last month\n• This year (2025)\n• Last year (2024)\n• All time\n• Custom date range",
+                "type": "missing_date_range"
+            }
+
+        # Pattern 2: Multiple date columns ambiguity
+        if any(word in question_lower for word in ['date', 'when', 'by month', 'by week', 'by year']):
+            # Check if schema has both visit_date and transaction_date
+            if 'visit_date' in schema_context.lower() and 'transaction_date' in schema_context.lower():
+                # Only ask if the question doesn't specify which date
+                if not any(word in question_lower for word in ['visit date', 'service date', 'transaction date', 'payment date', 'posting date']):
+                    return {
+                        "needs_clarification": True,
+                        "question": "Which date would you like to use?\n\nOptions:\n• **Visit Date** (when service was performed) - for operational analysis\n• **Transaction Date** (when payment posted) - for financial/cash flow analysis",
+                        "type": "date_column_ambiguity"
+                    }
+
+        # Pattern 3: Vague "show me" or "get me" without specifics
+        vague_requests = ['show me', 'get me', 'give me', 'list', 'display']
+        if any(vague in question_lower for vague in vague_requests):
+            # Check if it's too vague (just "show me X" without any filters or conditions)
+            words = question_lower.split()
+            if len(words) <= 4:  # Very short query
+                return {
+                    "needs_clarification": True,
+                    "question": "I'd be happy to help! Could you provide more details?\n\nFor example:\n• What specific information do you need?\n• Any filters (date range, status, provider, etc.)?\n• How would you like the data grouped or sorted?",
+                    "type": "vague_request"
+                }
+
+        # Pattern 4: Ambiguous "revenue" - could be gross charges vs collections
+        if 'revenue' in question_lower and 'payment' not in question_lower and 'collection' not in question_lower:
+            if 'charge' not in question_lower:
+                return {
+                    "needs_clarification": True,
+                    "question": "What type of revenue are you looking for?\n\nOptions:\n• **Gross Charges** (total billed amount)\n• **Collections** (actual payments received)\n• **Net Revenue** (collections minus adjustments)",
+                    "type": "revenue_ambiguity"
+                }
+
+        # No ambiguity detected
+        return {
+            "needs_clarification": False,
+            "question": None,
+            "type": None
+        }
 
     # ===== Nodes =====
 
@@ -198,6 +483,34 @@ class DatabaseQueryAgent:
         state["schema_context"] = schema_context
 
         logger.info(f"Loaded schema for {len(tables)} tables")
+
+        return state
+
+    def check_clarification_node(self, state: AgentState) -> AgentState:
+        """
+        Check if the question needs clarification before generating SQL.
+
+        This provides a ChatGPT-level UX by asking follow-up questions when the query is ambiguous.
+        """
+        logger.info("Checking if clarification is needed...")
+
+        # Detect ambiguity using the question and schema context
+        ambiguity = self._detect_ambiguity(
+            state["question"],
+            state.get("schema_context", "")
+        )
+
+        # Update state with clarification info
+        state["needs_clarification"] = ambiguity["needs_clarification"]
+        state["clarification_question"] = ambiguity["question"]
+        state["ambiguity_type"] = ambiguity["type"]
+
+        if ambiguity["needs_clarification"]:
+            # Set the clarification question as the answer
+            state["answer"] = ambiguity["question"]
+            logger.info(f"Clarification needed: {ambiguity['type']}")
+        else:
+            logger.info("No clarification needed, proceeding with SQL generation")
 
         return state
 
@@ -279,12 +592,58 @@ The previous query failed. Common MySQL issues to avoid:
 ═══════════════════════════════════════════════════════════════════
 """
 
+        # Get relevant examples for this question
+        relevant_examples = self._get_relevant_examples(state["question"], n=3)
+
+        # Get relationship context if multiple tables might be involved
+        available_tables = state.get("available_tables", [])
+        relationship_context = self._get_relationship_context(available_tables)
+
+        # Get business rules context
+        business_context = self._get_business_context(state["question"])
+
+        # Format relationship context
+        relationship_text = ""
+        if relationship_context:
+            relationship_text = "\n\n" + "="*60 + "\n"
+            relationship_text += "TABLE RELATIONSHIPS (Use these for multi-table queries):\n"
+            relationship_text += "="*60 + "\n"
+            relationship_text += relationship_context + "\n"
+            relationship_text += "="*60 + "\n"
+
+        # Format business rules context
+        business_text = ""
+        if business_context:
+            business_text = "\n\n" + "="*60 + "\n"
+            business_text += "BUSINESS RULES & KPIs:\n"
+            business_text += "="*60 + "\n"
+            business_text += business_context + "\n"
+            business_text += "="*60 + "\n"
+
+        # Format examples for prompt
+        examples_text = ""
+        if relevant_examples:
+            examples_text = "\n\n" + "="*60 + "\n"
+            examples_text += "EXAMPLE QUERIES (Learn from these patterns):\n"
+            examples_text += "="*60 + "\n\n"
+
+            for i, ex in enumerate(relevant_examples, 1):
+                examples_text += f"Example {i}: {ex['question']}\n"
+                examples_text += f"SQL: {ex['sql']}\n"
+                if ex.get("explanation"):
+                    examples_text += f"Note: {ex['explanation']}\n"
+                examples_text += "\n"
+
+            examples_text += "="*60 + "\n"
+
         # Build system prompt
         system_prompt = f"""You are a MySQL SQL expert. Convert the natural language question into a MySQL SQL query.
 
 Available tables and schemas:
 {state['schema_context']}
-
+{relationship_text}
+{business_text}
+{examples_text}
 Rules:
 - Generate ONLY SELECT queries (read-only)
 - Use proper table and column names exactly as shown in the schema
@@ -577,6 +936,12 @@ Provide a clear, concise answer that:
 
     # ===== Conditional edges =====
 
+    def route_after_clarification(self, state: AgentState) -> str:
+        """Route based on whether clarification is needed."""
+        if state.get("needs_clarification", False):
+            return "clarify"  # Return clarification question to user
+        return "proceed"  # Continue with SQL generation
+
     def check_sql_generated(self, state: AgentState) -> str:
         """Check if SQL was generated successfully."""
         if state.get("sql_query"):
@@ -638,17 +1003,40 @@ Provide a clear, concise answer that:
             return obj
 
     def _format_chat_history(self, chat_history: List[Dict[str, str]]) -> str:
-        """Format chat history for prompt."""
+        """
+        Format chat history for context.
+
+        Now includes FULL conversation history for ChatGPT-level context understanding.
+        Uses smart truncation only if conversation becomes extremely long (>50 messages).
+        """
         if not chat_history:
-            return "No previous conversation."
+            return "No previous conversation"
+
+        # Use FULL chat history for best context (no arbitrary 5-message limit!)
+        # Only truncate if conversation is extremely long (>50 messages = 25 exchanges)
+        if len(chat_history) > 50:
+            # Keep first 10 messages (context) + last 40 messages (recent conversation)
+            context_start = chat_history[:10]
+            recent = chat_history[-40:]
+            messages_to_format = context_start + [{"role": "system", "content": "... [conversation continued] ..."}] + recent
+        else:
+            # Use ALL messages for full context
+            messages_to_format = chat_history
 
         formatted = []
-        for msg in chat_history[-5:]:  # Last 5 messages
+
+        for msg in messages_to_format:
             role = msg.get("role", "user")
             content = msg.get("content", "")
-            formatted.append(f"{role.capitalize()}: {content}")
 
-        return "\n".join(formatted)
+            if role == "user":
+                formatted.append(f"User: {content}")
+            elif role == "assistant":
+                formatted.append(f"Assistant: {content}")
+            elif role == "system":
+                formatted.append(f"[{content}]")
+
+        return "\n".join(formatted) if formatted else "No previous conversation"
 
     # ===== Public API =====
 

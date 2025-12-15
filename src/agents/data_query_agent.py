@@ -34,6 +34,17 @@ class AgentState(TypedDict):
     question: str
     chat_history: List[Dict[str, str]]
 
+    # Question Interpretation (NEW for better inference)
+    interpreted_question: Optional[str]
+    question_type: Optional[str]  # 'definition', 'data_query', 'kpi_calculation', etc.
+    detected_acronyms: List[str]
+    reasoning: List[str]  # Verbose reasoning steps
+
+    # Clarification (for better UX)
+    needs_clarification: bool
+    clarification_question: Optional[str]
+    ambiguity_type: Optional[str]
+
     # Schema context
     available_tables: List[str]
     schema_context: str
@@ -119,6 +130,15 @@ class DataQueryAgent:
         # Load schema profiles
         self.schema_profiles = self._load_schema_profiles()
 
+        # Load few-shot examples for better SQL generation
+        self.query_examples = self._load_query_examples()
+
+        # Load table relationships for multi-table queries
+        self.relationships = self._load_relationships()
+
+        # Load business rules and domain knowledge
+        self.business_rules = self._load_business_rules()
+
         # Build graph
         self.graph = self._build_graph()
 
@@ -142,6 +162,372 @@ class DataQueryAgent:
 
         return profiles
 
+    def _load_query_examples(self) -> List[Dict[str, Any]]:
+        """Load few-shot query examples from JSON file."""
+        examples = []
+
+        # Look for examples file in schemas directory
+        examples_path = Path(__file__).parent.parent.parent / "schemas" / "query_examples_duckdb.json"
+
+        if not examples_path.exists():
+            logger.warning(f"Query examples file not found at {examples_path}")
+            return examples
+
+        try:
+            with open(examples_path, 'r') as f:
+                data = json.load(f)
+                examples = data.get("examples", [])
+                logger.info(f"Loaded {len(examples)} query examples")
+        except Exception as e:
+            logger.error(f"Error loading query examples: {e}")
+
+        return examples
+
+    def _get_relevant_examples(self, question: str, n: int = 3) -> List[Dict[str, Any]]:
+        """
+        Find relevant query examples based on keyword matching.
+
+        Args:
+            question: User's natural language question
+            n: Number of examples to return
+
+        Returns:
+            List of relevant examples
+        """
+        if not self.query_examples:
+            return []
+
+        question_lower = question.lower()
+
+        # Score each example
+        scored_examples = []
+        for ex in self.query_examples:
+            score = 0
+
+            # Check if question words appear in example question or tags
+            for word in question_lower.split():
+                # Skip common words
+                if word in ['the', 'a', 'an', 'is', 'are', 'was', 'were', 'what', 'how', 'show', 'me']:
+                    continue
+
+                if word in ex["question"].lower():
+                    score += 2
+                if word in " ".join(ex.get("tags", [])):
+                    score += 1
+
+            # Boost CRITICAL examples if they're relevant
+            if "CRITICAL" in ex.get("tags", []) and score > 0:
+                score += 3
+
+            if score > 0:
+                scored_examples.append((score, ex))
+
+        # Return top N examples
+        scored_examples.sort(reverse=True, key=lambda x: x[0])
+        return [ex for score, ex in scored_examples[:n]]
+
+    def _load_relationships(self) -> Dict[str, Any]:
+        """Load table relationships from JSON file."""
+        relationships = {}
+
+        # Look for relationships file in schemas directory
+        rel_path = Path(__file__).parent.parent.parent / "schemas" / "relationships.json"
+
+        if not rel_path.exists():
+            logger.warning(f"Relationships file not found at {rel_path}")
+            return relationships
+
+        try:
+            with open(rel_path, 'r') as f:
+                data = json.load(f)
+                relationships = data
+                logger.info(f"Loaded {len(data.get('tables', {}))} table relationships")
+        except Exception as e:
+            logger.error(f"Error loading relationships: {e}")
+
+        return relationships
+
+    def _get_relationship_context(self, tables: List[str]) -> str:
+        """
+        Get relationship context for tables mentioned in the question.
+
+        Args:
+            tables: List of table names potentially involved in the query
+
+        Returns:
+            Formatted relationship context string
+        """
+        if not self.relationships or not tables:
+            return ""
+
+        context_parts = []
+        table_data = self.relationships.get("tables", {})
+        join_paths = self.relationships.get("common_join_paths", [])
+
+        # Add relationship info for each table
+        for table in tables:
+            if table in table_data:
+                t_info = table_data[table]
+
+                # Show foreign keys (how this table joins to others)
+                if t_info.get("foreign_keys"):
+                    fks = []
+                    for col, fk_info in t_info["foreign_keys"].items():
+                        fks.append(f"{col} → {fk_info['references']}")
+                    if fks:
+                        context_parts.append(f"{table} joins to: {', '.join(fks)}")
+
+        # Add relevant common join paths
+        relevant_joins = [jp for jp in join_paths if any(t in jp.get("tables", []) for t in tables)]
+        if relevant_joins:
+            context_parts.append("\nCommon Join Patterns:")
+            for jp in relevant_joins[:3]:  # Show top 3 relevant joins
+                context_parts.append(f"  - {jp['description']}")
+                context_parts.append(f"    SQL: {jp['sql_template']}")
+
+        return "\n".join(context_parts) if context_parts else ""
+
+    def _load_business_rules(self) -> Dict[str, Any]:
+        """Load business rules and domain knowledge from JSON file."""
+        rules = {}
+
+        # Look for business rules file in schemas directory
+        rules_path = Path(__file__).parent.parent.parent / "schemas" / "business_rules.json"
+
+        if not rules_path.exists():
+            logger.warning(f"Business rules file not found at {rules_path}")
+            return rules
+
+        try:
+            with open(rules_path, 'r') as f:
+                data = json.load(f)
+                rules = data
+                logger.info(f"Loaded business rules with {len(data.get('kpi_definitions', {}))} KPI definitions")
+        except Exception as e:
+            logger.error(f"Error loading business rules: {e}")
+
+        return rules
+
+    def _get_business_context(self, question: str) -> str:
+        """
+        Get relevant business rules context based on the question.
+
+        Args:
+            question: User's natural language question
+
+        Returns:
+            Formatted business rules context string
+        """
+        if not self.business_rules:
+            return ""
+
+        context_parts = []
+        question_lower = question.lower()
+
+        # Check if question involves KPIs
+        kpi_defs = self.business_rules.get("kpi_definitions", {})
+        for kpi_name, kpi_info in kpi_defs.items():
+            if any(word in question_lower for word in kpi_name.lower().split()):
+                context_parts.append(f"KPI: {kpi_name}")
+                context_parts.append(f"  Formula: {kpi_info['formula']}")
+                context_parts.append(f"  SQL: {kpi_info['sql_template']}")
+
+        # Check if question involves date filtering
+        if any(word in question_lower for word in ['this month', 'last month', 'this year', 'current', 'ytd', 'last week']):
+            common_filters = self.business_rules.get("common_filters", {})
+            context_parts.append("\nCommon Date Filters:")
+            for filter_name, filter_info in list(common_filters.items())[:3]:
+                if isinstance(filter_info, dict):
+                    context_parts.append(f"  {filter_name}: {filter_info.get('sql', '')}")
+
+        return "\n".join(context_parts) if context_parts else ""
+
+    def _interpret_question(self, question: str) -> Dict[str, Any]:
+        """
+        Interpret the question with verbose reasoning to understand user intent.
+
+        This method adds intelligence and inference capabilities:
+        - Detects terminology/definition questions
+        - Expands acronyms to full terms
+        - Provides reasoning steps (verbose logging)
+        - Interprets what the user is really asking for
+
+        Returns:
+            Dict with interpreted_question, question_type, detected_acronyms, and reasoning steps
+        """
+        reasoning = []
+        detected_acronyms = []
+        question_lower = question.lower().strip()
+
+        # Get terminology from business rules
+        terminology = self.business_rules.get("terminology", {})
+        kpi_definitions = self.business_rules.get("kpi_definitions", {})
+
+        reasoning.append(f"📝 Original question: '{question}'")
+
+        # Pattern 1: Definition/Terminology questions
+        definition_patterns = [
+            r'^what\s+(is|does|means?)\s+(\w+)',
+            r'^define\s+(\w+)',
+            r'^explain\s+(\w+)',
+            r'^(\w+)\s+definition',
+            r'^(\w+)\s+meaning'
+        ]
+
+        for pattern in definition_patterns:
+            import re
+            match = re.search(pattern, question_lower)
+            if match:
+                # Extract the term being asked about
+                term = match.groups()[-1].upper()  # Get the last capturing group, uppercase
+
+                reasoning.append(f"🔍 Detected: This is a DEFINITION question about '{term}'")
+
+                # Check if it's an acronym we know
+                if term in terminology:
+                    detected_acronyms.append(term)
+                    full_term = terminology[term]
+                    reasoning.append(f"✓ Found acronym: {term} = {full_term}")
+
+                    # Check if it's also a KPI
+                    for kpi_name, kpi_info in kpi_definitions.items():
+                        if term in kpi_name.upper() or kpi_name.upper() in term:
+                            reasoning.append(f"📊 This is a KPI metric: {kpi_name}")
+                            reasoning.append(f"   Formula: {kpi_info['formula']}")
+
+                            return {
+                                "interpreted_question": f"Explain the {kpi_name} metric and its calculation",
+                                "question_type": "kpi_definition",
+                                "detected_acronyms": detected_acronyms,
+                                "reasoning": reasoning,
+                                "kpi_name": kpi_name,
+                                "kpi_info": kpi_info
+                            }
+
+                    return {
+                        "interpreted_question": f"Explain what {term} ({full_term}) means",
+                        "question_type": "terminology_definition",
+                        "detected_acronyms": detected_acronyms,
+                        "reasoning": reasoning,
+                        "term": term,
+                        "definition": full_term
+                    }
+
+        # Pattern 2: Data queries with acronyms - expand them for better SQL generation
+        expanded_question = question
+        for acronym, full_term in terminology.items():
+            # Case-insensitive replacement but preserve original casing context
+            if acronym.lower() in question_lower:
+                # Check if it's a standalone word (not part of another word)
+                import re
+                pattern = r'\b' + re.escape(acronym) + r'\b'
+                if re.search(pattern, question, re.IGNORECASE):
+                    detected_acronyms.append(acronym)
+                    # Expand in the interpreted question for LLM
+                    expanded_question = re.sub(pattern, f"{acronym} ({full_term})", expanded_question, flags=re.IGNORECASE)
+                    reasoning.append(f"🔄 Expanded acronym: {acronym} → {full_term}")
+
+        # Pattern 3: KPI calculation queries
+        kpi_patterns = ['calculate', 'compute', 'rate', 'ratio', 'percentage']
+        if any(pattern in question_lower for pattern in kpi_patterns):
+            for kpi_name in kpi_definitions.keys():
+                if any(word in question_lower for word in kpi_name.lower().split()):
+                    reasoning.append(f"📊 Detected KPI calculation request: {kpi_name}")
+                    return {
+                        "interpreted_question": expanded_question,
+                        "question_type": "kpi_calculation",
+                        "detected_acronyms": detected_acronyms,
+                        "reasoning": reasoning,
+                        "kpi_name": kpi_name
+                    }
+
+        # Pattern 4: Categorization/Grouping queries
+        grouping_patterns = ['categorized by', 'grouped by', 'breakdown by', 'segmented by', 'by']
+        if any(pattern in question_lower for pattern in grouping_patterns):
+            reasoning.append("📊 Detected: This is a DATA GROUPING/CATEGORIZATION query")
+
+            # Check if grouping by a metric (like NCR or GCR)
+            for acronym in detected_acronyms:
+                if acronym in ['NCR', 'GCR']:
+                    reasoning.append(f"⚠️  User wants to GROUP BY {acronym} - this requires calculating {acronym} ranges/buckets")
+
+        # Default: treat as data query
+        if not reasoning or len(reasoning) == 1:  # Only has the original question
+            reasoning.append("💾 Interpreted as: DATA QUERY (will generate SQL)")
+
+        return {
+            "interpreted_question": expanded_question,
+            "question_type": "data_query",
+            "detected_acronyms": detected_acronyms,
+            "reasoning": reasoning
+        }
+
+    def _detect_ambiguity(self, question: str, schema_context: str) -> Dict[str, Any]:
+        """
+        Detect if the question is ambiguous and needs clarification.
+
+        Returns:
+            Dict with 'needs_clarification', 'question', and 'type' keys
+        """
+        question_lower = question.lower()
+
+        # Pattern 1: Missing date range for aggregate queries
+        has_aggregate = any(word in question_lower for word in [
+            'total', 'sum', 'count', 'average', 'avg', 'how many', 'revenue', 'charges'
+        ])
+        has_date_filter = any(word in question_lower for word in [
+            '2024', '2025', 'this month', 'last month', 'this year', 'last year',
+            'january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+            'september', 'october', 'november', 'december', 'week', 'quarter', 'ytd'
+        ])
+
+        if has_aggregate and not has_date_filter:
+            return {
+                "needs_clarification": True,
+                "question": "For what time period would you like this analysis?\n\nOptions:\n• This month\n• Last month\n• This year (2025)\n• Last year (2024)\n• All time\n• Custom date range",
+                "type": "missing_date_range"
+            }
+
+        # Pattern 2: Multiple date columns ambiguity
+        if any(word in question_lower for word in ['date', 'when', 'by month', 'by week', 'by year']):
+            # Check if schema has both visit_date and transaction_date
+            if 'visit_date' in schema_context.lower() and 'transaction_date' in schema_context.lower():
+                # Only ask if the question doesn't specify which date
+                if not any(word in question_lower for word in ['visit date', 'service date', 'transaction date', 'payment date', 'posting date']):
+                    return {
+                        "needs_clarification": True,
+                        "question": "Which date would you like to use?\n\nOptions:\n• **Visit Date** (when service was performed) - for operational analysis\n• **Transaction Date** (when payment posted) - for financial/cash flow analysis",
+                        "type": "date_column_ambiguity"
+                    }
+
+        # Pattern 3: Vague "show me" or "get me" without specifics
+        vague_requests = ['show me', 'get me', 'give me', 'list', 'display']
+        if any(vague in question_lower for vague in vague_requests):
+            # Check if it's too vague (just "show me X" without any filters or conditions)
+            words = question_lower.split()
+            if len(words) <= 4:  # Very short query
+                return {
+                    "needs_clarification": True,
+                    "question": "I'd be happy to help! Could you provide more details?\n\nFor example:\n• What specific information do you need?\n• Any filters (date range, status, provider, etc.)?\n• How would you like the data grouped or sorted?",
+                    "type": "vague_request"
+                }
+
+        # Pattern 4: Ambiguous "revenue" - could be gross charges vs collections
+        if 'revenue' in question_lower and 'payment' not in question_lower and 'collection' not in question_lower:
+            if 'charge' not in question_lower:
+                return {
+                    "needs_clarification": True,
+                    "question": "What type of revenue are you looking for?\n\nOptions:\n• **Gross Charges** (total billed amount)\n• **Collections** (actual payments received)\n• **Net Revenue** (collections minus adjustments)",
+                    "type": "revenue_ambiguity"
+                }
+
+        # No ambiguity detected
+        return {
+            "needs_clarification": False,
+            "question": None,
+            "type": None
+        }
+
     def _build_graph(self) -> StateGraph:
         """Build the LangGraph workflow."""
         workflow = StateGraph(AgentState)
@@ -150,7 +536,9 @@ class DataQueryAgent:
         workflow.add_node("detect_intent", self.detect_intent_node)
         workflow.add_node("handle_weekly_report", self.handle_weekly_report_node)
         workflow.add_node("handle_denial_analysis", self.handle_denial_analysis_node)
+        workflow.add_node("interpret_question", self.interpret_question_node)
         workflow.add_node("load_schema", self.load_schema_node)
+        workflow.add_node("check_clarification", self.check_clarification_node)
         workflow.add_node("generate_sql", self.generate_sql_node)
         workflow.add_node("validate_sql", self.validate_sql_node)
         workflow.add_node("execute_query", self.execute_query_node)
@@ -167,13 +555,35 @@ class DataQueryAgent:
             {
                 "weekly_report": "handle_weekly_report",
                 "denial_analysis": "handle_denial_analysis",
-                "normal_query": "load_schema"
+                "normal_query": "interpret_question"  # Changed: interpret question first
             }
         )
 
         workflow.add_edge("handle_weekly_report", END)
         workflow.add_edge("handle_denial_analysis", END)
-        workflow.add_edge("load_schema", "generate_sql")
+
+        # After interpretation, either answer definition or continue to schema loading
+        workflow.add_conditional_edges(
+            "interpret_question",
+            self.route_after_interpretation,
+            {
+                "definition_answered": END,  # Definition questions answered directly
+                "continue": "load_schema"  # Data queries continue to SQL generation
+            }
+        )
+
+        # After loading schema, check if clarification is needed
+        workflow.add_edge("load_schema", "check_clarification")
+
+        # Route based on clarification check
+        workflow.add_conditional_edges(
+            "check_clarification",
+            self.route_after_clarification,
+            {
+                "clarify": END,  # Return clarification question to user
+                "proceed": "generate_sql"  # Continue with SQL generation
+            }
+        )
 
         workflow.add_conditional_edges(
             "generate_sql",
@@ -323,6 +733,95 @@ class DataQueryAgent:
 
         return state
 
+    def interpret_question_node(self, state: AgentState) -> AgentState:
+        """
+        Interpret the user's question with verbose reasoning.
+
+        This adds intelligence:
+        - Detects if it's a definition question vs data query
+        - Expands acronyms (NCR → Net Collection Rate)
+        - Shows reasoning steps (verbose logging)
+        - Handles definition questions without SQL
+        """
+        logger.info("=" * 80)
+        logger.info("🧠 QUESTION INTERPRETATION PHASE")
+        logger.info("=" * 80)
+
+        # Interpret the question
+        interpretation = self._interpret_question(state["question"])
+
+        # Log reasoning steps (VERBOSE)
+        logger.info("\n📋 REASONING PROCESS:")
+        for step in interpretation["reasoning"]:
+            logger.info(f"   {step}")
+
+        # Store interpretation in state
+        state["interpreted_question"] = interpretation["interpreted_question"]
+        state["question_type"] = interpretation["question_type"]
+        state["detected_acronyms"] = interpretation.get("detected_acronyms", [])
+        state["reasoning"] = interpretation["reasoning"]
+
+        logger.info(f"\n🎯 Question Type: {interpretation['question_type']}")
+        logger.info(f"📝 Interpreted Question: {interpretation['interpreted_question']}")
+
+        # Handle definition/terminology questions directly (no SQL needed)
+        if interpretation["question_type"] == "kpi_definition":
+            kpi_name = interpretation.get("kpi_name")
+            kpi_info = interpretation.get("kpi_info")
+
+            answer = f"**{kpi_name}**\n\n"
+            answer += f"**Definition:** {kpi_info.get('description', 'N/A')}\n\n"
+            answer += f"**Formula:** {kpi_info.get('formula', 'N/A')}\n\n"
+            answer += f"**SQL Calculation:** `{kpi_info.get('sql_template', 'N/A')}`\n\n"
+            answer += f"**Category:** {kpi_info.get('category', 'N/A')}\n\n"
+
+            if kpi_info.get("required_columns"):
+                answer += f"**Required Data:** {', '.join(kpi_info['required_columns'])}\n\n"
+
+            answer += "\n💡 **Want to see actual data?** Ask me to calculate this metric for a specific time period!"
+
+            state["answer"] = answer
+            state["execution_success"] = True
+            state["metadata"] = {
+                "question_type": "kpi_definition",
+                "kpi_name": kpi_name,
+                "handled_without_sql": True
+            }
+
+            logger.info("\n✅ Definition question answered directly (no SQL needed)")
+            logger.info("=" * 80)
+
+        elif interpretation["question_type"] == "terminology_definition":
+            term = interpretation.get("term")
+            definition = interpretation.get("definition")
+
+            answer = f"**{term}** stands for **{definition}**.\n\n"
+
+            # Add context if available
+            terminology = self.business_rules.get("terminology", {})
+            if term in terminology:
+                answer += f"{terminology[term]}\n\n"
+
+            answer += "\n💡 **Want to see related metrics?** Ask me to calculate or show data related to this term!"
+
+            state["answer"] = answer
+            state["execution_success"] = True
+            state["metadata"] = {
+                "question_type": "terminology_definition",
+                "term": term,
+                "handled_without_sql": True
+            }
+
+            logger.info("\n✅ Terminology question answered directly (no SQL needed)")
+            logger.info("=" * 80)
+
+        else:
+            # Data query - continue to SQL generation
+            logger.info(f"\n➡️  Proceeding to SQL generation with interpreted question")
+            logger.info("=" * 80)
+
+        return state
+
     def load_schema_node(self, state: AgentState) -> AgentState:
         """Load schema information for relevant tables."""
         logger.info("Loading schema context...")
@@ -363,6 +862,37 @@ class DataQueryAgent:
                         if semantic and semantic != ["unknown"]:
                             col_desc += f" - {', '.join(semantic)}"
 
+                        # Add statistical context for better LLM understanding
+                        stats_parts = []
+
+                        # For categorical columns: show top values
+                        if col.get("top_values"):
+                            top_vals = col["top_values"][:3]  # Show top 3
+                            vals_str = ", ".join([f"'{v['value']}' ({v['percentage']:.0f}%)"
+                                                 for v in top_vals])
+                            stats_parts.append(f"Common values: {vals_str}")
+
+                        # For numeric columns: show range
+                        elif col.get("data_category") == "numeric" and col.get("min") is not None:
+                            min_val = col.get("min", 0)
+                            max_val = col.get("max", 0)
+                            avg_val = col.get("mean", 0)
+                            stats_parts.append(f"Range: {min_val:.2f} to {max_val:.2f}, Avg: {avg_val:.2f}")
+
+                        # For datetime columns: show date range
+                        elif col.get("data_category") == "datetime" and col.get("min"):
+                            min_date = col.get("min", "")
+                            max_date = col.get("max", "")
+                            stats_parts.append(f"Date range: {min_date} to {max_date}")
+
+                        # Add null percentage if significant
+                        null_pct = col.get("null_percentage", 0)
+                        if null_pct > 5:  # Only show if >5% nulls
+                            stats_parts.append(f"{null_pct:.1f}% null")
+
+                        if stats_parts:
+                            col_desc += f" [{'; '.join(stats_parts)}]"
+
                     schema_parts.append(col_desc)
             else:
                 for col in schema:
@@ -376,6 +906,34 @@ class DataQueryAgent:
         state["schema_context"] = schema_context
 
         logger.info(f"Loaded schema for {len(tables)} tables")
+
+        return state
+
+    def check_clarification_node(self, state: AgentState) -> AgentState:
+        """
+        Check if the question needs clarification before generating SQL.
+
+        This provides a ChatGPT-level UX by asking follow-up questions when the query is ambiguous.
+        """
+        logger.info("Checking if clarification is needed...")
+
+        # Detect ambiguity using the question and schema context
+        ambiguity = self._detect_ambiguity(
+            state["question"],
+            state.get("schema_context", "")
+        )
+
+        # Update state with clarification info
+        state["needs_clarification"] = ambiguity["needs_clarification"]
+        state["clarification_question"] = ambiguity["question"]
+        state["ambiguity_type"] = ambiguity["type"]
+
+        if ambiguity["needs_clarification"]:
+            # Set the clarification question as the answer
+            state["answer"] = ambiguity["question"]
+            logger.info(f"Clarification needed: {ambiguity['type']}")
+        else:
+            logger.info("No clarification needed, proceeding with SQL generation")
 
         return state
 
@@ -514,12 +1072,58 @@ KEY POINT: For "break down by month", you only need year, month, and aggregated 
 
 """
 
+        # Get relevant examples for this question
+        relevant_examples = self._get_relevant_examples(state["question"], n=3)
+
+        # Get relationship context if multiple tables might be involved
+        available_tables = state.get("available_tables", [])
+        relationship_context = self._get_relationship_context(available_tables)
+
+        # Get business rules context
+        business_context = self._get_business_context(state["question"])
+
+        # Format relationship context
+        relationship_text = ""
+        if relationship_context:
+            relationship_text = "\n\n" + "="*60 + "\n"
+            relationship_text += "TABLE RELATIONSHIPS (Use these for multi-table queries):\n"
+            relationship_text += "="*60 + "\n"
+            relationship_text += relationship_context + "\n"
+            relationship_text += "="*60 + "\n"
+
+        # Format business rules context
+        business_text = ""
+        if business_context:
+            business_text = "\n\n" + "="*60 + "\n"
+            business_text += "BUSINESS RULES & KPIs:\n"
+            business_text += "="*60 + "\n"
+            business_text += business_context + "\n"
+            business_text += "="*60 + "\n"
+
+        # Format examples for prompt
+        examples_text = ""
+        if relevant_examples:
+            examples_text = "\n\n" + "="*60 + "\n"
+            examples_text += "EXAMPLE QUERIES (Learn from these patterns):\n"
+            examples_text += "="*60 + "\n\n"
+
+            for i, ex in enumerate(relevant_examples, 1):
+                examples_text += f"Example {i}: {ex['question']}\n"
+                examples_text += f"SQL: {ex['sql']}\n"
+                if ex.get("explanation"):
+                    examples_text += f"Note: {ex['explanation']}\n"
+                examples_text += "\n"
+
+            examples_text += "="*60 + "\n"
+
         # Build system prompt
         system_prompt = f"""You are a SQL expert. Convert the natural language question into a DuckDB SQL query.
 
 Available tables and schemas:
 {state['schema_context']}
-
+{relationship_text}
+{business_text}
+{examples_text}
 Rules:
 - Generate ONLY SELECT queries (read-only)
 - Use proper table and column names exactly as shown
@@ -550,11 +1154,17 @@ Previous conversation:
 If validation or execution failed previously, fix this error: {error_msg}{error_guidance}
 """
 
-        # Generate SQL
+        # Generate SQL using interpreted question (with expanded acronyms)
+        question_for_sql = state.get("interpreted_question") or state["question"]
+
+        logger.info(f"📝 Question for SQL generation: {question_for_sql}")
+        if state.get("detected_acronyms"):
+            logger.info(f"🔄 Expanded acronyms: {', '.join(state['detected_acronyms'])}")
+
         try:
             messages = [
                 SystemMessage(content=system_prompt),
-                HumanMessage(content=state["question"])
+                HumanMessage(content=question_for_sql)  # Use interpreted question with expanded acronyms
             ]
 
             response = self.llm.invoke(messages)
@@ -566,7 +1176,7 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
 
             state["sql_query"] = sql_query
 
-            logger.info(f"Generated SQL: {sql_query}")
+            logger.info(f"✅ Generated SQL: {sql_query}")
 
         except Exception as e:
             logger.error(f"Error generating SQL: {e}")
@@ -739,6 +1349,22 @@ Provide a clear, concise answer that:
             return "denial_analysis"
         return "normal_query"
 
+    def route_after_interpretation(self, state: AgentState) -> str:
+        """Route based on whether interpretation answered the question."""
+        # Check if it's a definition question that was answered
+        question_type = state.get("question_type")
+        if question_type in ["kpi_definition", "terminology_definition"]:
+            logger.info("📤 Returning definition answer directly (no SQL needed)")
+            return "definition_answered"
+        # Otherwise continue to schema loading and SQL generation
+        return "continue"
+
+    def route_after_clarification(self, state: AgentState) -> str:
+        """Route based on whether clarification is needed."""
+        if state.get("needs_clarification", False):
+            return "clarify"  # Return clarification question to user
+        return "proceed"  # Continue with SQL generation
+
     def check_sql_generated(self, state: AgentState) -> str:
         """Check if SQL was generated successfully."""
         if state.get("sql_query"):
@@ -820,16 +1446,29 @@ Provide a clear, concise answer that:
         return obj
 
     def _format_chat_history(self, chat_history: List[Dict[str, str]]) -> str:
-        """Format chat history for context."""
+        """
+        Format chat history for context.
+
+        Now includes FULL conversation history for ChatGPT-level context understanding.
+        Uses smart truncation only if conversation becomes extremely long (>50 messages).
+        """
         if not chat_history:
             return "No previous conversation"
 
-        # Take last 5 exchanges (10 messages)
-        recent = chat_history[-10:]
+        # Use FULL chat history for best context (no arbitrary 10-message limit!)
+        # Only truncate if conversation is extremely long (>50 messages = 25 exchanges)
+        if len(chat_history) > 50:
+            # Keep first 10 messages (context) + last 40 messages (recent conversation)
+            context_start = chat_history[:10]
+            recent = chat_history[-40:]
+            messages_to_format = context_start + [{"role": "system", "content": "... [conversation continued] ..."}] + recent
+        else:
+            # Use ALL messages for full context
+            messages_to_format = chat_history
 
         formatted = []
 
-        for msg in recent:
+        for msg in messages_to_format:
             role = msg.get("role", "")
             content = msg.get("content", "")
 
@@ -837,6 +1476,8 @@ Provide a clear, concise answer that:
                 formatted.append(f"User: {content}")
             elif role == "assistant":
                 formatted.append(f"Assistant: {content}")
+            elif role == "system":
+                formatted.append(f"[{content}]")
 
         return "\n".join(formatted) if formatted else "No previous conversation"
 

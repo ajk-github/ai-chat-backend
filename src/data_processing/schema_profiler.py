@@ -190,19 +190,38 @@ class SchemaProfiler:
 
         # Check if lengths has any non-null values to avoid numpy warnings
         if lengths.dropna().empty:
-            return {
+            profile = {
                 "data_category": "text",
                 "min_length": None,
                 "max_length": None,
                 "avg_length": None,
             }
+        else:
+            profile = {
+                "data_category": "text",
+                "min_length": int(lengths.min()),
+                "max_length": int(lengths.max()),
+                "avg_length": float(lengths.mean()),
+            }
 
-        return {
-            "data_category": "text",
-            "min_length": int(lengths.min()),
-            "max_length": int(lengths.max()),
-            "avg_length": float(lengths.mean()),
-        }
+        # Add top values for categorical columns (low cardinality)
+        unique_count = series.nunique()
+        total_count = len(series)
+
+        # If column has low cardinality (< 50 unique values or < 5% unique), treat as categorical
+        if unique_count < 50 or (unique_count / total_count) < 0.05:
+            value_counts = series.value_counts().head(10)
+            profile["top_values"] = [
+                {
+                    "value": str(val),
+                    "count": int(count),
+                    "percentage": round(count / total_count * 100, 2)
+                }
+                for val, count in value_counts.items()
+            ]
+            profile["semantic_category"] = "categorical"
+
+        return profile
 
     def _profile_boolean(self, series: pd.Series) -> Dict[str, Any]:
         """Profile boolean column."""

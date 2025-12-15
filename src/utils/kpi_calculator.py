@@ -880,8 +880,8 @@ class KPICalculator:
         week_num += 1
         current_date = first_monday + timedelta(days=1)  # Next day (Tuesday)
 
-        # Remaining weeks: Tuesday-Monday
-        while current_date <= last_day:
+        # Remaining weeks: Tuesday-Monday (max 5 weeks total in a month)
+        while current_date <= last_day and week_num <= 5:  # Limit to max 5 weeks
             # Find next Monday (end of week)
             next_monday = current_date
             for _ in range(7):
@@ -928,16 +928,17 @@ class KPICalculator:
         logger.info(f"Generating weekly breakdown report for {company_name}...")
 
         try:
-            # Step 1: Check for Transaction Date column (REQUIRED for both forecast and actuals)
-            transaction_date_col = None
-            transaction_date_columns = ['transaction_date', 'transactiondate', 'payment_date', 'date_created']
-            for col in transaction_date_columns:
+            # Step 1: Check for Visit Created Date column (REQUIRED for both forecast and actuals)
+            # Changed from transaction_date to date_created as per requirements
+            visit_created_date_col = None
+            visit_created_date_columns = ['date_created', 'datecreated', 'visit_created_date', 'created_date']
+            for col in visit_created_date_columns:
                 if col in self.df.columns:
-                    transaction_date_col = col
+                    visit_created_date_col = col
                     break
 
-            if transaction_date_col is None:
-                logger.warning("Transaction Date column not found - forecast and actuals will not be available")
+            if visit_created_date_col is None:
+                logger.warning("Visit Created Date column not found - forecast and actuals will not be available")
                 # Still need to determine year/month for week structure
                 # Try to get from visit_date as fallback for date detection only
                 visit_date_col = None
@@ -972,10 +973,10 @@ class KPICalculator:
                         "week_start": week_info['start_date'].strftime('%Y-%m-%d'),
                         "week_end": week_info['end_date'].strftime('%Y-%m-%d'),
                         "days": week_info['days'],
-                        "forecasted_visits": "transaction date not available",
-                        "actual_visits": "transaction date not available",
-                        "forecasted_collections": "transaction date not available",
-                        "actual_collections": "transaction date not available",
+                        "forecasted_visits": "visit created date not available",
+                        "actual_visits": "visit created date not available",
+                        "forecasted_collections": "visit created date not available",
+                        "actual_collections": "visit created date not available",
                     }
 
                 return {
@@ -984,15 +985,15 @@ class KPICalculator:
                     "month": month,
                     "month_name": datetime(year, month, 1).strftime('%B'),
                     "generated_at": datetime.now().isoformat(),
-                    "avg_daily_visits": "transaction date not available",
-                    "avg_daily_collections": "transaction date not available",
+                    "avg_daily_visits": "visit created date not available",
+                    "avg_daily_collections": "visit created date not available",
                     "weeks": weekly_data
                 }
 
-            # Parse Transaction Date
+            # Parse Visit Created Date
             df_copy = self.df.copy()
-            df_copy[transaction_date_col] = pd.to_datetime(df_copy[transaction_date_col], errors='coerce')
-            df_copy = df_copy[df_copy[transaction_date_col].notna()]
+            df_copy[visit_created_date_col] = pd.to_datetime(df_copy[visit_created_date_col], errors='coerce')
+            df_copy = df_copy[df_copy[visit_created_date_col].notna()]
 
             if df_copy.empty:
                 return {
@@ -1000,13 +1001,13 @@ class KPICalculator:
                     "year": year,
                     "month": month,
                     "generated_at": datetime.now().isoformat(),
-                    "error": "No valid dates found in Transaction Date column.",
+                    "error": "No valid dates found in Visit Created Date column.",
                     "weeks": {}
                 }
 
-            # Auto-detect latest year/month if not specified (using transaction_date)
+            # Auto-detect latest year/month if not specified (using visit_created_date)
             if year is None or month is None:
-                latest_date = df_copy[transaction_date_col].max()
+                latest_date = df_copy[visit_created_date_col].max()
                 year = latest_date.year
                 month = latest_date.month
                 logger.info(f"Auto-detected latest month: {year}-{month:02d}")
@@ -1015,7 +1016,7 @@ class KPICalculator:
             prev_3_months = self._get_previous_3_complete_months(year, month)
             logger.info(f"Using previous 3 complete months for forecast: {prev_3_months}")
 
-            # Filter data for previous 3 complete months (using Transaction Date)
+            # Filter data for previous 3 complete months (using Visit Created Date)
             df_three_months = pd.DataFrame()
             total_days_in_3_months = 0
 
@@ -1028,8 +1029,8 @@ class KPICalculator:
                 month_end = datetime(prev_year, prev_month, days_in_month)
 
                 month_data = df_copy[
-                    (df_copy[transaction_date_col] >= month_start) &
-                    (df_copy[transaction_date_col] <= month_end)
+                    (df_copy[visit_created_date_col] >= month_start) &
+                    (df_copy[visit_created_date_col] <= month_end)
                 ]
                 df_three_months = pd.concat([df_three_months, month_data])
 
@@ -1037,12 +1038,17 @@ class KPICalculator:
             total_visits_3m = len(df_three_months) if not df_three_months.empty else 0
             avg_daily_visits = total_visits_3m / total_days_in_3_months if total_days_in_3_months > 0 else 0
 
-            # Collections: total payment from 3 months
-            if 'total_payment' in df_three_months.columns and not df_three_months.empty:
-                total_collections_3m = float(df_three_months[df_three_months['total_payment'] > 0]['total_payment'].sum())
+            # Collections forecast: charges from 3 months * 0.48 collection rate
+            # Formula: avg_daily_charges = SUM(charges_last_3_months) / total_days_in_3_months
+            #          avg_daily_collections = avg_daily_charges * 0.48
+            if 'charge' in df_three_months.columns and not df_three_months.empty:
+                total_charges_3m = float(df_three_months[df_three_months['charge'] > 0]['charge'].sum())
             else:
-                total_collections_3m = 0.0
-            avg_daily_collections = total_collections_3m / total_days_in_3_months if total_days_in_3_months > 0 else 0
+                total_charges_3m = 0.0
+
+            # Calculate avg daily charges, then multiply by 0.48 for expected collections
+            avg_daily_charges = total_charges_3m / total_days_in_3_months if total_days_in_3_months > 0 else 0
+            avg_daily_collections = avg_daily_charges * 0.48  # 48% collection rate
 
             logger.info(f"3-month averages: {avg_daily_visits:.2f} visits/day, ${avg_daily_collections:,.2f} collections/day")
 
@@ -1055,6 +1061,10 @@ class KPICalculator:
             cumulative_actual_visits = 0
             cumulative_actual_collections = 0.0
 
+            # Get current date to determine if week is in the future
+            from datetime import datetime as dt
+            today = dt.now().date()
+
             weekly_data = {}
 
             for week_info in weeks:
@@ -1063,27 +1073,39 @@ class KPICalculator:
                 week_end = week_info['end_date']
                 days_in_week = week_info['days']
 
-                # Cumulative forecast (using Transaction Date)
+                # Cumulative forecast (using Visit Created Date)
                 cumulative_days += days_in_week
                 cumulative_forecasted_visits = round(avg_daily_visits * cumulative_days)
                 cumulative_forecasted_collections = avg_daily_collections * cumulative_days
 
-                # Actual values for this week (using Transaction Date)
-                week_df = df_copy[
-                    (df_copy[transaction_date_col].notna()) &
-                    (df_copy[transaction_date_col] >= week_start) &
-                    (df_copy[transaction_date_col] <= week_end)
-                ]
+                # Check if this week has passed (week_end is before or equal to today)
+                week_has_passed = week_end.date() <= today
 
-                actual_visits = len(week_df)
-                if 'total_payment' in week_df.columns:
-                    actual_collections = float(week_df[week_df['total_payment'] > 0]['total_payment'].sum())
+                if week_has_passed:
+                    # Actual values for this week (using Visit Created Date)
+                    week_df = df_copy[
+                        (df_copy[visit_created_date_col].notna()) &
+                        (df_copy[visit_created_date_col] >= week_start) &
+                        (df_copy[visit_created_date_col] <= week_end)
+                    ]
+
+                    actual_visits = len(week_df)
+                    if 'total_payment' in week_df.columns:
+                        actual_collections = float(week_df[week_df['total_payment'] > 0]['total_payment'].sum())
+                    else:
+                        actual_collections = 0.0
+
+                    # Add to cumulative actuals
+                    cumulative_actual_visits += actual_visits
+                    cumulative_actual_collections += actual_collections
+
+                    # Store cumulative actuals
+                    actual_visits_display = cumulative_actual_visits
+                    actual_collections_display = round(cumulative_actual_collections, 2)
                 else:
-                    actual_collections = 0.0
-
-                # Add to cumulative actuals
-                cumulative_actual_visits += actual_visits
-                cumulative_actual_collections += actual_collections
+                    # Future week - don't show actuals
+                    actual_visits_display = None  # Will show as empty in report
+                    actual_collections_display = None
 
                 weekly_data[f"week_{week_num}"] = {
                     "week": week_num,
@@ -1091,9 +1113,10 @@ class KPICalculator:
                     "week_end": week_end.strftime('%Y-%m-%d'),
                     "days": days_in_week,
                     "forecasted_visits": cumulative_forecasted_visits,
-                    "actual_visits": cumulative_actual_visits,
+                    "actual_visits": actual_visits_display,
                     "forecasted_collections": round(cumulative_forecasted_collections, 2),
-                    "actual_collections": round(cumulative_actual_collections, 2),
+                    "actual_collections": actual_collections_display,
+                    "is_future": not week_has_passed
                 }
 
             logger.info(f"Weekly breakdown report generated for {year}-{month:02d}")
@@ -1157,6 +1180,7 @@ class KPICalculator:
             week_num = week_data['week']
             forecasted_collections = week_data.get('forecasted_collections', 0)
             actual_collections = week_data.get('actual_collections', 0)
+            is_future = week_data.get('is_future', False)
 
             # Format forecasted collections (handle string if visit_created_date not available)
             if isinstance(forecasted_collections, str):
@@ -1164,8 +1188,10 @@ class KPICalculator:
             else:
                 forecasted_collections_str = f"${forecasted_collections:,.2f}"
 
-            # Format actual collections (handle string if visit_created_date not available)
-            if isinstance(actual_collections, str):
+            # Format actual collections (handle None for future weeks, string for unavailable, or number)
+            if actual_collections is None or is_future:
+                actual_collections_str = "-"  # Empty for future weeks
+            elif isinstance(actual_collections, str):
                 actual_collections_str = actual_collections
             else:
                 actual_collections_str = f"${actual_collections:,.2f}"
@@ -1182,6 +1208,7 @@ class KPICalculator:
             week_num = week_data['week']
             forecasted_visits = week_data.get('forecasted_visits', 0)
             actual_visits = week_data.get('actual_visits', 0)
+            is_future = week_data.get('is_future', False)
 
             # Format forecasted visits (handle string if visit_created_date not available)
             if isinstance(forecasted_visits, str):
@@ -1189,8 +1216,10 @@ class KPICalculator:
             else:
                 forecasted_visits_str = f"{forecasted_visits:,}"
 
-            # Format actual visits (handle string if visit_created_date not available)
-            if isinstance(actual_visits, str):
+            # Format actual visits (handle None for future weeks, string for unavailable, or number)
+            if actual_visits is None or is_future:
+                actual_visits_str = "-"  # Empty for future weeks
+            elif isinstance(actual_visits, str):
                 actual_visits_str = actual_visits
             else:
                 actual_visits_str = f"{actual_visits:,}"
@@ -1201,39 +1230,51 @@ class KPICalculator:
 
     def generate_weekly_comparison_report(self, company_name: str = "Company") -> Dict[str, Any]:
         """
-        Generate a weekly comparison report showing metrics based on Date of Service vs Date Created.
-        Shows data for the latest complete week only.
+        Generate a weekly comparison report showing metrics based on DOS (visit_date) vs Date Created (visit_created_date).
+        Shows data for the latest complete week only - single week, not past 5 weeks.
 
         Args:
             company_name: Name of the company for the report
 
         Returns:
-            Dictionary containing weekly comparison metrics
+            Dictionary containing weekly comparison metrics with DOS and Date Created columns
         """
         logger.info(f"Generating weekly comparison report for {company_name}...")
 
-        # Find visit_date column (Date of Service)
-        date_col = None
-        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date']
-        for col in date_columns:
+        df_copy = self.df.copy()
+
+        # Find visit_date column (Date of Service / DOS)
+        visit_date_col = None
+        visit_date_columns = ['visit_date', 'visitdate', 'date', 'dos', 'date_of_service', 'service_date']
+        for col in visit_date_columns:
             if col in self.df.columns:
-                date_col = col
+                visit_date_col = col
                 break
 
-        if date_col is None:
-            logger.warning("No date column found. Cannot generate weekly comparison report.")
+        # Find visit_created_date column (Date Created)
+        visit_created_date_col = None
+        visit_created_date_columns = ['date_created', 'datecreated', 'visit_created_date', 'created_date']
+        for col in visit_created_date_columns:
+            if col in self.df.columns:
+                visit_created_date_col = col
+                break
+
+        if visit_date_col is None and visit_created_date_col is None:
+            logger.warning("No date columns found. Cannot generate weekly comparison report.")
             return {
                 "company": company_name,
                 "generated_at": datetime.now().isoformat(),
-                "error": "No date field found in data.",
+                "error": "No date fields found in data.",
                 "weekly_comparison": {}
             }
 
         try:
-            # Parse dates
-            df_copy = self.df.copy()
-            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
-            df_copy = df_copy[df_copy[date_col].notna()]
+            # Determine the latest week to show (based on whichever date column is available)
+            # Priority: visit_created_date for detecting latest data, fallback to visit_date
+            reference_col = visit_created_date_col if visit_created_date_col else visit_date_col
+
+            df_copy[reference_col] = pd.to_datetime(df_copy[reference_col], errors='coerce')
+            df_copy = df_copy[df_copy[reference_col].notna()]
 
             if df_copy.empty:
                 return {
@@ -1243,60 +1284,58 @@ class KPICalculator:
                     "weekly_comparison": {}
                 }
 
-            # Get the last 7 days from the most recent date in the data
-            latest_date = df_copy[date_col].max()
+            # Get the latest week (7 days ending on the most recent date)
+            latest_date = df_copy[reference_col].max()
             week_end = latest_date
-            week_start = latest_date - timedelta(days=6)  # Go back 6 days to get 7 days total
+            week_start = latest_date - timedelta(days=6)  # 7 days total
 
-            logger.info(f"Last 7 days: {week_start.date()} to {week_end.date()}")
+            logger.info(f"Latest week: {week_start.date()} to {week_end.date()}")
 
-            # Filter for latest week based on Date of Service (for visits)
-            df_dos = df_copy[
-                (df_copy[date_col] >= week_start) &
-                (df_copy[date_col] <= week_end)
-            ]
+            # --- Calculate DOS Metrics (using visit_date) ---
+            collections_dos = 0.0
+            charges_dos = 0.0
+            visits_dos = 0
 
-            # Calculate visits based on visit_date
-            visits_dos = len(df_dos) if not df_dos.empty else 0
-
-            # Find transaction_date column for collections
-            transaction_date_col = None
-            transaction_date_columns = ['transaction_date', 'transactiondate', 'payment_date', 'date_created']
-            for col in transaction_date_columns:
-                if col in df_copy.columns:
-                    transaction_date_col = col
-                    break
-
-            # Calculate collections based on transaction_date (when payment was received)
-            if transaction_date_col:
-                # Parse transaction dates
-                df_copy[transaction_date_col] = pd.to_datetime(df_copy[transaction_date_col], errors='coerce')
-
-                # Filter by transaction_date for collections
-                df_transactions = df_copy[
-                    (df_copy[transaction_date_col].notna()) &
-                    (df_copy[transaction_date_col] >= week_start) &
-                    (df_copy[transaction_date_col] <= week_end)
+            if visit_date_col:
+                df_copy[visit_date_col] = pd.to_datetime(df_copy[visit_date_col], errors='coerce')
+                df_dos = df_copy[
+                    (df_copy[visit_date_col].notna()) &
+                    (df_copy[visit_date_col] >= week_start) &
+                    (df_copy[visit_date_col] <= week_end)
                 ]
 
-                # Calculate collections from transactions in this week
-                transaction_calc = KPICalculator(df_transactions) if not df_transactions.empty else None
-                collections_dos = transaction_calc._calculate_filtered_payments() if transaction_calc else 0.0
-                logger.info(f"Collections calculated using transaction_date: ${collections_dos:,.2f}")
-            else:
-                # Fallback to visit_date if transaction_date not available
+                visits_dos = len(df_dos) if not df_dos.empty else 0
+
                 dos_calc = KPICalculator(df_dos) if not df_dos.empty else None
                 collections_dos = dos_calc._calculate_filtered_payments() if dos_calc else 0.0
-                logger.warning(f"transaction_date column not found - using visit_date for collections")
+                charges_dos = dos_calc._calculate_filtered_charges() if dos_calc else 0.0
 
-            # Charges still use visit_date
-            dos_calc = KPICalculator(df_dos) if not df_dos.empty else None
-            charges_dos = dos_calc._calculate_filtered_charges() if dos_calc else 0.0
+                logger.info(f"DOS metrics: {visits_dos} visits, ${collections_dos:,.2f} collections, ${charges_dos:,.2f} charges")
+            else:
+                logger.warning("visit_date column not found - DOS metrics will be 0")
 
-            # For Slide 7, we use single values (not comparison)
-            collections_dc = collections_dos
-            charges_dc = charges_dos
-            visits_dc = visits_dos
+            # --- Calculate Date Created Metrics (using visit_created_date) ---
+            collections_dc = 0.0
+            charges_dc = 0.0
+            visits_dc = 0
+
+            if visit_created_date_col:
+                df_copy[visit_created_date_col] = pd.to_datetime(df_copy[visit_created_date_col], errors='coerce')
+                df_dc = df_copy[
+                    (df_copy[visit_created_date_col].notna()) &
+                    (df_copy[visit_created_date_col] >= week_start) &
+                    (df_copy[visit_created_date_col] <= week_end)
+                ]
+
+                visits_dc = len(df_dc) if not df_dc.empty else 0
+
+                dc_calc = KPICalculator(df_dc) if not df_dc.empty else None
+                collections_dc = dc_calc._calculate_filtered_payments() if dc_calc else 0.0
+                charges_dc = dc_calc._calculate_filtered_charges() if dc_calc else 0.0
+
+                logger.info(f"Date Created metrics: {visits_dc} visits, ${collections_dc:,.2f} collections, ${charges_dc:,.2f} charges")
+            else:
+                logger.warning("visit_created_date column not found - Date Created metrics will be 0")
 
             logger.info(f"Weekly comparison report generated for {week_start.date()} to {week_end.date()}")
             return {
@@ -1326,6 +1365,7 @@ class KPICalculator:
     def format_weekly_comparison_as_text(self, report: Dict[str, Any]) -> str:
         """
         Format the weekly comparison report as human-readable text.
+        Shows Collections, Charges, and Visits with both DOS and Date Created columns.
 
         Args:
             report: Report dictionary from generate_weekly_comparison_report()
@@ -1345,21 +1385,22 @@ class KPICalculator:
         if not comparison:
             return f"❌ No weekly comparison data available."
 
-        # Format output as markdown table (single column using visit_date)
-        output = f"""## SLIDE 7: {company.upper()} - CLIENT SUMMARY WEEKLY ({week_start} - {week_end})
+        # Format output as markdown table with Collections, Charges, Visits each having DOS and Date Created columns
+        output = f"""## SLIDE 7: {company.upper()} - CLIENT SUMMARY - WEEKLY COMPARISON
 
-| Metric | Amount |
-|--------|--------|
-| Collections | ${comparison['collections_dc']:,.2f} |
-| Charges | ${comparison['charges_dc']:,.2f} |
-| Visits | {comparison['visits_dc']:,} |
+**Week:** {week_start} - {week_end}
+
+|  | **Collections** |  | **Charges** |  | **Visits** |  |
+|--|-----------------|--|-------------|--|------------|--|
+| **Month/Week** | **DOS** | **Date Created** | **DOS** | **Date Created** | **DOS** | **Date Created** |
+| {week_start} - {week_end} | ${comparison['collections_dos']:,.2f} | ${comparison['collections_dc']:,.2f} | ${comparison['charges_dos']:,.2f} | ${comparison['charges_dc']:,.2f} | {comparison['visits_dos']:,} | {comparison['visits_dc']:,} |
 """
         return output.strip()
 
     def generate_monthly_comparison_report(self, company_name: str = "Company") -> Dict[str, Any]:
         """
         Generate a month-to-date comparison report showing metrics for current month plus
-        last 3 months with the same day range. Both columns use visit_date.
+        last 3 months with the same day range. Shows DOS (visit_date) and Date Created (visit_created_date) columns.
 
         Example: If latest date is Nov 16, show Nov 1-16, Oct 1-16, Sep 1-16, Aug 1-16
 
@@ -1367,30 +1408,42 @@ class KPICalculator:
             company_name: Name of the company for the report
 
         Returns:
-            Dictionary containing month-to-date comparison metrics for 4 months
+            Dictionary containing month-to-date comparison metrics for 4 months with DOS and Date Created columns
         """
         logger.info(f"Generating month-to-date comparison report for {company_name}...")
 
-        # Find visit_date column (Date of Service)
-        date_col = None
-        for col in ['visit_date', 'Visit Date', 'VisitDate']:
+        df_copy = self.df.copy()
+
+        # Find visit_date column (Date of Service / DOS)
+        visit_date_col = None
+        visit_date_columns = ['visit_date', 'visitdate', 'date', 'dos', 'date_of_service', 'service_date']
+        for col in visit_date_columns:
             if col in self.df.columns:
-                date_col = col
+                visit_date_col = col
                 break
 
-        if date_col is None:
+        # Find visit_created_date column (Date Created)
+        visit_created_date_col = None
+        visit_created_date_columns = ['date_created', 'datecreated', 'visit_created_date', 'created_date']
+        for col in visit_created_date_columns:
+            if col in self.df.columns:
+                visit_created_date_col = col
+                break
+
+        if visit_date_col is None and visit_created_date_col is None:
             return {
                 "company": company_name,
                 "generated_at": datetime.now().isoformat(),
-                "error": "No visit_date field found in data.",
+                "error": "No date fields found in data.",
                 "monthly_comparison": {}
             }
 
         try:
-            # Parse dates
-            df_copy = self.df.copy()
-            df_copy[date_col] = pd.to_datetime(df_copy[date_col], errors='coerce')
-            df_copy = df_copy[df_copy[date_col].notna()]
+            # Determine reference column for date range (priority: visit_created_date, fallback: visit_date)
+            reference_col = visit_created_date_col if visit_created_date_col else visit_date_col
+
+            df_copy[reference_col] = pd.to_datetime(df_copy[reference_col], errors='coerce')
+            df_copy = df_copy[df_copy[reference_col].notna()]
 
             if df_copy.empty:
                 return {
@@ -1401,7 +1454,7 @@ class KPICalculator:
                 }
 
             # Get latest date and calculate day range
-            latest_date = df_copy[date_col].max()
+            latest_date = df_copy[reference_col].max()
             day_of_month = latest_date.day
 
             logger.info(f"Latest date: {latest_date}, using day range 1-{day_of_month}")
@@ -1427,27 +1480,51 @@ class KPICalculator:
                 month_label = f"{first_of_target_month.strftime('%b %d')} - {last_of_range.strftime('%b %d, %Y')}"
                 logger.info(f"Calculating for month {months_back}: {month_label}")
 
-                # Filter data for this month range
-                df_month = df_copy[
-                    (df_copy[date_col] >= first_of_target_month) &
-                    (df_copy[date_col] <= last_of_range)
-                ]
+                # --- Calculate DOS Metrics (using visit_date) ---
+                collections_dos = 0.0
+                charges_dos = 0.0
+                visits_dos = 0
 
-                # Calculate metrics based on visit_date (used for both DOS and DC)
-                calc = KPICalculator(df_month) if not df_month.empty else None
-                collections = calc._calculate_filtered_payments() if calc else 0.0
-                charges = calc._calculate_filtered_charges() if calc else 0.0
-                visits = calc.calculate_total_visits() if calc else 0
+                if visit_date_col:
+                    df_copy[visit_date_col] = pd.to_datetime(df_copy[visit_date_col], errors='coerce')
+                    df_month_dos = df_copy[
+                        (df_copy[visit_date_col].notna()) &
+                        (df_copy[visit_date_col] >= first_of_target_month) &
+                        (df_copy[visit_date_col] <= last_of_range)
+                    ]
+
+                    calc_dos = KPICalculator(df_month_dos) if not df_month_dos.empty else None
+                    collections_dos = calc_dos._calculate_filtered_payments() if calc_dos else 0.0
+                    charges_dos = calc_dos._calculate_filtered_charges() if calc_dos else 0.0
+                    visits_dos = calc_dos.calculate_total_visits() if calc_dos else 0
+
+                # --- Calculate Date Created Metrics (using visit_created_date) ---
+                collections_dc = 0.0
+                charges_dc = 0.0
+                visits_dc = 0
+
+                if visit_created_date_col:
+                    df_copy[visit_created_date_col] = pd.to_datetime(df_copy[visit_created_date_col], errors='coerce')
+                    df_month_dc = df_copy[
+                        (df_copy[visit_created_date_col].notna()) &
+                        (df_copy[visit_created_date_col] >= first_of_target_month) &
+                        (df_copy[visit_created_date_col] <= last_of_range)
+                    ]
+
+                    calc_dc = KPICalculator(df_month_dc) if not df_month_dc.empty else None
+                    collections_dc = calc_dc._calculate_filtered_payments() if calc_dc else 0.0
+                    charges_dc = calc_dc._calculate_filtered_charges() if calc_dc else 0.0
+                    visits_dc = calc_dc.calculate_total_visits() if calc_dc else 0
 
                 months_data.append({
                     "month_label": month_label,
                     "month_name": first_of_target_month.strftime('%B %Y'),
-                    "collections_dos": collections,
-                    "collections_dc": collections,  # Same as DOS since both use visit_date
-                    "charges_dos": charges,
-                    "charges_dc": charges,  # Same as DOS since both use visit_date
-                    "visits_dos": visits,
-                    "visits_dc": visits  # Same as DOS since both use visit_date
+                    "collections_dos": collections_dos,
+                    "collections_dc": collections_dc,
+                    "charges_dos": charges_dos,
+                    "charges_dc": charges_dc,
+                    "visits_dos": visits_dos,
+                    "visits_dc": visits_dc
                 })
 
             return {
@@ -1469,13 +1546,13 @@ class KPICalculator:
     def format_monthly_comparison_as_text(self, report: Dict[str, Any]) -> str:
         """
         Format the month-to-date comparison report as human-readable text.
-        Shows 4 months (current + last 3) with same day range.
+        Shows 4 months (current + last 3) with same day range and DOS vs Date Created columns.
 
         Args:
             report: Report dictionary from generate_monthly_comparison_report()
 
         Returns:
-            Formatted text month-to-date comparison report
+            Formatted text month-to-date comparison report with DOS and Date Created columns
         """
         company = report["company"]
         day_range = report.get("day_range", "")
@@ -1488,18 +1565,21 @@ class KPICalculator:
         if not months_data:
             return f"❌ No month-to-date comparison data available."
 
-        # Format output as markdown table with all 4 months
-        output = f"""## SLIDE 8: {company.upper()} - CLIENT SUMMARY MONTH TO DATE (Day Range: {day_range})
+        # Reverse the order to show oldest to newest (ascending order)
+        months_data_reversed = list(reversed(months_data))
 
-| Month | Collections | Charges | Visits |
-|-------|-------------|---------|--------|"""
+        # Format output as markdown table with DOS and Date Created columns for each metric
+        output = f"""## SLIDE 8: {company.upper()} - CLIENT SUMMARY MONTH TO DATE
 
-        for month in months_data:
+**Day Range:** {day_range}
+
+|  | **Collections** |  | **Charges** |  | **Visits** |  |
+|--|-----------------|--|-------------|--|------------|--|
+| **Month** | **DOS** | **Date Created** | **DOS** | **Date Created** | **DOS** | **Date Created** |"""
+
+        for month in months_data_reversed:
             month_name = month['month_name']
-            collections = month['collections_dc']  # Using visit_date
-            charges = month['charges_dc']
-            visits = month['visits_dc']
-            output += f"\n| {month_name} | ${collections:,.2f} | ${charges:,.2f} | {visits:,} |"
+            output += f"\n| {month_name} | ${month['collections_dos']:,.2f} | ${month['collections_dc']:,.2f} | ${month['charges_dos']:,.2f} | ${month['charges_dc']:,.2f} | {month['visits_dos']:,} | {month['visits_dc']:,} |"
 
         return output.strip()
 
