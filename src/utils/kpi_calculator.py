@@ -2698,9 +2698,9 @@ class KPICalculator:
         """
         logger.info(f"Generating billing progress report for {company_name}...")
 
-        # Find date column
+        # Find date column (prioritize visit_created_date for Slide 2)
         date_col = None
-        date_columns = ['visit_date', 'date', 'dos', 'date_of_service', 'service_date', 'transaction_date']
+        date_columns = ['visit_created_date', 'visit_date', 'date', 'dos', 'date_of_service', 'service_date', 'transaction_date']
         for col in date_columns:
             if col in self.df.columns:
                 date_col = col

@@ -75,8 +75,50 @@ class AgentState(TypedDict):
     # Denial analysis
     is_denial_analysis: bool
 
+    # Multi-query analytical mode (NEW)
+    is_analytical_query: bool
+    analytical_pattern: Optional[str]  # trend_analysis, root_cause, comparison, correlation
+    detected_kpis: List[str]
+    detected_timeframes: List[str]
+    query_plan: Optional[Dict[str, Any]]  # QueryPlan structure
+    multi_query_results: Optional[Dict[str, Dict[str, Any]]]  # Dict[query_id, QueryResult]
+    sql_generation_errors: List[Dict[str, str]]
+    successful_queries: List[str]
+    failed_queries: List[str]
+
     # Status logging
     status_logger: Optional[Any]  # StatusLogger instance
+
+
+# ===== Multi-Query Data Structures =====
+
+class SubQuery(TypedDict):
+    """Represents a single sub-query in a multi-query plan."""
+    query_id: str  # e.g., "q1", "q2"
+    description: str  # What this query answers
+    purpose: str  # baseline_data, contributing_factors, correlations
+    priority: int  # 1=critical, 2=important, 3=supplementary
+    sql_query: Optional[str]  # Generated SQL (None initially)
+    depends_on: List[str]  # List of query_ids this depends on (for sequential execution)
+
+
+class QueryPlan(TypedDict):
+    """Represents a complete multi-query analytical plan."""
+    analytical_pattern: str  # trend_analysis, root_cause, comparison, correlation
+    detected_kpis: List[str]  # KPIs mentioned in question
+    detected_timeframes: List[str]  # Time periods mentioned
+    sub_queries: List[SubQuery]  # 2-5 focused sub-queries
+    reasoning: List[str]  # LLM's reasoning for this decomposition
+
+
+class QueryResult(TypedDict):
+    """Results from executing a single sub-query."""
+    query_id: str
+    success: bool
+    rows: Optional[List[Dict[str, Any]]]  # Query results
+    row_count: int
+    execution_time_seconds: float
+    error: Optional[str]  # Error message if failed
 
 
 # ===== Agent Class =====
@@ -585,6 +627,13 @@ class DataQueryAgent:
         workflow.add_node("interpret_question", self.interpret_question_node)
         workflow.add_node("load_schema", self.load_schema_node)
         workflow.add_node("check_clarification", self.check_clarification_node)
+        workflow.add_node("detect_analytical_pattern", self.detect_analytical_pattern_node)
+        # Multi-query path nodes
+        workflow.add_node("plan_multi_query", self.plan_multi_query_node)
+        workflow.add_node("generate_multi_sql", self.generate_multi_sql_node)
+        workflow.add_node("execute_multi_query", self.execute_multi_query_node)
+        workflow.add_node("synthesize_analytical_response", self.synthesize_analytical_response_node)
+        # Single-query path nodes (existing)
         workflow.add_node("generate_sql", self.generate_sql_node)
         workflow.add_node("validate_sql", self.validate_sql_node)
         workflow.add_node("execute_query", self.execute_query_node)
@@ -627,10 +676,55 @@ class DataQueryAgent:
             self.route_after_clarification,
             {
                 "clarify": END,  # Return clarification question to user
-                "proceed": "generate_sql"  # Continue with SQL generation
+                "proceed": "detect_analytical_pattern"  # Check if multi-query needed
             }
         )
 
+        # Route based on analytical pattern detection
+        workflow.add_conditional_edges(
+            "detect_analytical_pattern",
+            self.route_query_strategy,
+            {
+                "plan_multi_query": "plan_multi_query",  # Multi-query path for analytical questions
+                "generate_sql": "generate_sql"  # Single query path for simple questions
+            }
+        )
+
+        # ===== MULTI-QUERY PATH =====
+        # plan_multi_query → check if planning succeeded
+        workflow.add_conditional_edges(
+            "plan_multi_query",
+            self.check_query_plan,
+            {
+                "proceed": "generate_multi_sql",  # Planning succeeded, generate SQL
+                "error": "handle_error"  # Planning failed
+            }
+        )
+
+        # generate_multi_sql → check if any SQL was generated
+        workflow.add_conditional_edges(
+            "generate_multi_sql",
+            self.check_multi_sql_generated,
+            {
+                "proceed": "execute_multi_query",  # At least one SQL generated
+                "error": "handle_error"  # All SQL generation failed
+            }
+        )
+
+        # execute_multi_query → check if any queries succeeded
+        workflow.add_conditional_edges(
+            "execute_multi_query",
+            self.check_multi_execution,
+            {
+                "synthesize": "synthesize_analytical_response",  # At least one query succeeded
+                "error": "handle_error"  # All queries failed
+            }
+        )
+
+        # synthesize_analytical_response → END (answer ready)
+        workflow.add_edge("synthesize_analytical_response", END)
+
+        # ===== SINGLE-QUERY PATH (existing) =====
         workflow.add_conditional_edges(
             "generate_sql",
             self.check_sql_generated,
@@ -1009,6 +1103,858 @@ class DataQueryAgent:
             logger.info(f"Clarification needed: {ambiguity['type']}")
         else:
             logger.info("No clarification needed, proceeding with SQL generation")
+
+        return state
+
+    def detect_analytical_pattern_node(self, state: AgentState) -> AgentState:
+        """
+        Detect if the question requires multi-query analytical decomposition.
+
+        Identifies analytical patterns (trend, root cause, comparison, correlation)
+        and extracts KPIs and timeframes mentioned in the question.
+        """
+        from utils.status_logger import StepStatus
+
+        logger.info("Detecting analytical pattern...")
+
+        # Log start
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Detect Analytical Pattern",
+                status=StepStatus.RUNNING,
+                details="Analyzing question to determine if multi-query decomposition is needed"
+            )
+
+        question_lower = state["question"].lower()
+
+        # Pattern 1: Trend Analysis
+        trend_keywords = ["trend", "increase", "decrease", "decline", "growth",
+                         "change over time", "changed", "changing", "going up", "going down",
+                         "rising", "falling", "grew", "dropped"]
+
+        # Pattern 2: Root Cause Analysis
+        root_cause_keywords = ["why", "what caused", "factors", "reasons",
+                              "causes", "explain the", "behind", "drivers",
+                              "what drove", "what led to"]
+
+        # Pattern 3: Comparison Analysis
+        comparison_keywords = ["compare", "vs", "versus", "difference between",
+                              "month-over-month", "year-over-year", "yoy", "mom",
+                              "compared to", "comparison"]
+
+        # Pattern 4: Correlation Analysis
+        correlation_keywords = ["correlation", "relationship", "impact",
+                               "affect", "related to", "connection between",
+                               "associated with", "linked to"]
+
+        # Detect pattern
+        analytical_pattern = None
+        if any(kw in question_lower for kw in root_cause_keywords):
+            analytical_pattern = "root_cause"
+        elif any(kw in question_lower for kw in trend_keywords):
+            analytical_pattern = "trend_analysis"
+        elif any(kw in question_lower for kw in comparison_keywords):
+            analytical_pattern = "comparison"
+        elif any(kw in question_lower for kw in correlation_keywords):
+            analytical_pattern = "correlation"
+
+        # Detect KPIs mentioned
+        detected_kpis = []
+        if self.business_rules:
+            kpi_defs = self.business_rules.get("kpi_definitions", {})
+            terminology = self.business_rules.get("terminology", {})
+
+            # First, check for acronyms using the terminology mapping
+            for acronym in state.get("detected_acronyms", []):
+                acronym_upper = acronym.upper()
+                # Check if acronym is in terminology
+                if acronym_upper in terminology:
+                    full_term = terminology[acronym_upper]
+                    # Find matching KPI
+                    for kpi_name in kpi_defs.keys():
+                        if full_term.lower() in kpi_name.lower() or kpi_name.lower() in full_term.lower():
+                            if kpi_name not in detected_kpis:
+                                detected_kpis.append(kpi_name)
+
+            # Then check for full KPI names in the question
+            for kpi_name in kpi_defs.keys():
+                # Check both full name and lowercase
+                if kpi_name.lower() in question_lower:
+                    if kpi_name not in detected_kpis:
+                        detected_kpis.append(kpi_name)
+
+        # Detect timeframes
+        detected_timeframes = []
+        import re
+
+        # Look for month names
+        months = ["january", "february", "march", "april", "may", "june",
+                 "july", "august", "september", "october", "november", "december",
+                 "jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"]
+        for month in months:
+            if month in question_lower:
+                detected_timeframes.append(month.capitalize())
+
+        # Look for years
+        years = re.findall(r'\b(20\d{2})\b', question_lower)
+        detected_timeframes.extend(years)
+
+        # Look for quarter references
+        if "q1" in question_lower or "quarter 1" in question_lower:
+            detected_timeframes.append("Q1")
+        if "q2" in question_lower or "quarter 2" in question_lower:
+            detected_timeframes.append("Q2")
+        if "q3" in question_lower or "quarter 3" in question_lower:
+            detected_timeframes.append("Q3")
+        if "q4" in question_lower or "quarter 4" in question_lower:
+            detected_timeframes.append("Q4")
+
+        # Determine if analytical query
+        # Requires: pattern detected + KPI mentioned (or strong analytical intent)
+        is_analytical = bool(analytical_pattern and (detected_kpis or len(detected_timeframes) > 1))
+
+        # Update state
+        state["is_analytical_query"] = is_analytical
+        state["analytical_pattern"] = analytical_pattern
+        state["detected_kpis"] = detected_kpis
+        state["detected_timeframes"] = detected_timeframes
+
+        logger.info(f"Analytical Detection: pattern={analytical_pattern}, "
+                   f"kpis={detected_kpis}, timeframes={detected_timeframes}, "
+                   f"is_analytical={is_analytical}")
+
+        # Log completion
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Detect Analytical Pattern",
+                status=StepStatus.COMPLETED,
+                details=f"Pattern: {analytical_pattern or 'none'}, Mode: {'MULTI-QUERY' if is_analytical else 'SINGLE-QUERY'}",
+                reasoning=[
+                    f"Analytical pattern detected: {analytical_pattern or 'none'}",
+                    f"KPIs identified: {', '.join(detected_kpis) if detected_kpis else 'none'}",
+                    f"Timeframes detected: {', '.join(detected_timeframes) if detected_timeframes else 'none'}",
+                    f"Will use: {'Multi-query decomposition' if is_analytical else 'Single SQL query'}"
+                ],
+                metadata={
+                    "is_analytical": is_analytical,
+                    "pattern": analytical_pattern,
+                    "kpi_count": len(detected_kpis),
+                    "timeframe_count": len(detected_timeframes)
+                }
+            )
+
+        return state
+
+    def plan_multi_query_node(self, state: AgentState) -> AgentState:
+        """
+        Plan multi-query decomposition for analytical questions.
+
+        Uses LLM to decompose the question into 2-5 focused sub-queries.
+        Each sub-query has a specific purpose and priority.
+        """
+        from utils.status_logger import StepStatus
+        import json
+
+        logger.info("Planning multi-query decomposition...")
+
+        # Log start
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Plan Multi-Query Decomposition",
+                status=StepStatus.RUNNING,
+                details="Breaking down analytical question into focused sub-queries"
+            )
+
+        question = state["question"]
+        analytical_pattern = state.get("analytical_pattern", "unknown")
+        detected_kpis = state.get("detected_kpis", [])
+        detected_timeframes = state.get("detected_timeframes", [])
+
+        # Get business context for KPIs
+        business_context = self._get_business_context(question)
+
+        # Build the query planning prompt
+        query_planning_prompt = f"""You are an expert data analyst specializing in breaking down complex analytical questions into focused sub-queries.
+
+ANALYTICAL QUESTION: "{question}"
+
+DETECTED CONTEXT:
+- Pattern Type: {analytical_pattern}
+- KPIs Mentioned: {', '.join(detected_kpis) if detected_kpis else 'none'}
+- Timeframes: {', '.join(detected_timeframes) if detected_timeframes else 'none'}
+
+BUSINESS RULES & KPI DEFINITIONS:
+{business_context}
+
+YOUR TASK:
+Decompose this analytical question into 2-5 focused sub-queries. Each sub-query should:
+1. Answer a specific aspect of the overall question
+2. Be simple enough to translate into a single SQL query
+3. Provide data needed to synthesize the final comprehensive answer
+
+GUIDELINES:
+- For ROOT CAUSE questions: Break down into baseline data + contributing factors
+  * CRITICAL: If the question mentions a time range (e.g., "January to November"), get MONTH-BY-MONTH progression, NOT just start/end points
+  * Example: "Why did NCR decline Jan to Nov?" → Query should get NCR for EACH month (Jan, Feb, Mar, Apr, May, Jun, Jul, Aug, Sep, Oct, Nov)
+  * This reveals WHEN the decline happened and HOW it progressed over time
+
+- For TREND questions: Get data points over time with proper granularity
+  * Monthly data for questions spanning multiple months
+  * Quarterly data for questions spanning multiple quarters
+  * Yearly data for questions spanning multiple years
+
+- For COMPARISON questions: Get separate data for each entity/timeframe being compared
+  * Include proper time dimensions (month, quarter, year) for grouping
+
+- For CORRELATION questions: Get both variables independently, then compare
+  * Ensure both metrics are calculated over the same time periods
+
+TIME-BASED QUERY RULES:
+1. When a question mentions "from X to Y" time period, capture ALL time points in between, not just X and Y
+2. Each sub-query should request data "by month" or "by quarter" to enable proper grouping
+3. Contributing factor queries should use the SAME time granularity as the baseline query
+
+Sub-query priorities:
+- Priority 1 (Critical): Baseline data needed to answer the question
+- Priority 2 (Important): Contributing factors or additional context
+- Priority 3 (Supplementary): Nice-to-have supporting data
+
+OUTPUT FORMAT (JSON):
+{{
+  "reasoning": [
+    "Step-by-step explanation of how you broke down the question",
+    "Why each sub-query is needed",
+    "How the results will combine to answer the question"
+  ],
+  "sub_queries": [
+    {{
+      "query_id": "q1",
+      "description": "Clear description of what this query answers",
+      "purpose": "baseline_data | contributing_factors | correlations",
+      "priority": 1,
+      "depends_on": []
+    }},
+    {{
+      "query_id": "q2",
+      "description": "...",
+      "purpose": "contributing_factors",
+      "priority": 2,
+      "depends_on": ["q1"]
+    }}
+  ]
+}}
+
+IMPORTANT:
+- Generate 2-5 sub-queries (no more, no less)
+- Each description should be specific enough to generate SQL
+- Use detected KPIs and timeframes in your planning
+- Return ONLY valid JSON, no explanations outside the JSON structure
+"""
+
+        try:
+            messages = [
+                SystemMessage(content="You are an expert at decomposing analytical questions into focused sub-queries. Always respond with valid JSON."),
+                HumanMessage(content=query_planning_prompt)
+            ]
+
+            response = self.llm.invoke(messages)
+
+            # Parse JSON response
+            response_text = response.content.strip()
+
+            # Clean up response (remove markdown if present)
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            if response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+
+            query_plan_dict = json.loads(response_text)
+
+            # Validate structure
+            if "sub_queries" not in query_plan_dict or not query_plan_dict["sub_queries"]:
+                raise ValueError("Query plan must contain at least one sub-query")
+
+            # Enforce 2-5 sub-queries
+            if len(query_plan_dict["sub_queries"]) < 2:
+                raise ValueError("Query plan must have at least 2 sub-queries")
+            if len(query_plan_dict["sub_queries"]) > 5:
+                logger.warning(f"Query plan has {len(query_plan_dict['sub_queries'])} sub-queries, truncating to 5")
+                query_plan_dict["sub_queries"] = query_plan_dict["sub_queries"][:5]
+
+            # Add detected context to query plan
+            query_plan_dict["analytical_pattern"] = analytical_pattern
+            query_plan_dict["detected_kpis"] = detected_kpis
+            query_plan_dict["detected_timeframes"] = detected_timeframes
+
+            # Initialize sql_query field for each sub-query
+            for sub_query in query_plan_dict["sub_queries"]:
+                if "sql_query" not in sub_query:
+                    sub_query["sql_query"] = None
+                if "depends_on" not in sub_query:
+                    sub_query["depends_on"] = []
+
+            state["query_plan"] = query_plan_dict
+
+            logger.info(f"✅ Query plan created with {len(query_plan_dict['sub_queries'])} sub-queries")
+            for sq in query_plan_dict["sub_queries"]:
+                logger.info(f"   {sq['query_id']}: {sq['description']} (priority {sq['priority']})")
+
+            # Log completion
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Plan Multi-Query Decomposition",
+                    status=StepStatus.COMPLETED,
+                    details=f"Created plan with {len(query_plan_dict['sub_queries'])} sub-queries",
+                    reasoning=query_plan_dict.get("reasoning", []),
+                    metadata={
+                        "sub_query_count": len(query_plan_dict["sub_queries"]),
+                        "sub_queries": [f"{sq['query_id']}: {sq['description']}" for sq in query_plan_dict["sub_queries"]]
+                    }
+                )
+
+        except json.JSONDecodeError as e:
+            logger.error(f"Failed to parse query plan JSON: {e}")
+            logger.error(f"Response was: {response_text[:500]}")
+            state["error"] = f"Failed to parse query plan: {str(e)}"
+            state["query_plan"] = None
+
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Plan Multi-Query Decomposition",
+                    status=StepStatus.FAILED,
+                    details=f"JSON parsing error: {str(e)}"
+                )
+
+        except Exception as e:
+            logger.error(f"Error planning multi-query: {e}")
+            state["error"] = f"Failed to plan multi-query: {str(e)}"
+            state["query_plan"] = None
+
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Plan Multi-Query Decomposition",
+                    status=StepStatus.FAILED,
+                    details=f"Planning error: {str(e)}"
+                )
+
+        return state
+
+    def generate_multi_sql_node(self, state: AgentState) -> AgentState:
+        """
+        Generate SQL for each sub-query in the multi-query plan.
+
+        Uses focused prompts for each sub-query to generate simple, reliable SQL.
+        Tracks failures but continues with other queries (graceful degradation).
+        """
+        from utils.status_logger import StepStatus
+
+        logger.info("Generating SQL for multi-query plan...")
+
+        # Log start
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Generate Multi-Query SQL",
+                status=StepStatus.RUNNING,
+                details="Generating SQL for each sub-query in the plan"
+            )
+
+        query_plan = state.get("query_plan")
+        if not query_plan or not query_plan.get("sub_queries"):
+            logger.error("No query plan available for SQL generation")
+            state["error"] = "No query plan available"
+            return state
+
+        sql_generation_errors = []
+        successful_count = 0
+
+        # Loop through each sub-query and generate SQL
+        for sub_query in query_plan["sub_queries"]:
+            query_id = sub_query["query_id"]
+            description = sub_query["description"]
+            purpose = sub_query.get("purpose", "unknown")
+
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Generating SQL for {query_id}: {description}")
+            logger.info(f"{'='*70}")
+
+            try:
+                # Build focused SQL generation prompt for this sub-query
+                multi_sql_prompt = f"""You are a SQL expert. Generate a DuckDB SQL query for this specific data request.
+
+SUB-QUERY REQUEST: {description}
+
+PURPOSE: {purpose}
+
+CONTEXT FROM ORIGINAL QUESTION:
+- Pattern: {query_plan.get('analytical_pattern', 'unknown')}
+- KPIs: {', '.join(query_plan.get('detected_kpis', []))}
+- Timeframes: {', '.join(query_plan.get('detected_timeframes', []))}
+
+AVAILABLE SCHEMA:
+{state.get('schema_context', 'No schema available')}
+
+BUSINESS RULES:
+{self._get_business_context(description)}
+
+CRITICAL DUCKDB RULES:
+1. WHERE clause: CANNOT use column aliases - use full expressions
+   WRONG: WHERE year = 2025
+   CORRECT: WHERE EXTRACT(YEAR FROM visit_date) = 2025
+
+2. GROUP BY clause: CANNOT use column aliases - use full expressions
+   WRONG: GROUP BY year, month
+   CORRECT: GROUP BY EXTRACT(YEAR FROM visit_date), EXTRACT(MONTH FROM visit_date)
+
+3. DATE extraction: When grouping by date parts, only select the extracted values
+   WRONG: SELECT EXTRACT(MONTH FROM visit_date) AS month, visit_date, COUNT(*)
+   CORRECT: SELECT EXTRACT(MONTH FROM visit_date) AS month, COUNT(*)
+
+4. Return ONLY the SQL query without explanation, markdown, or formatting
+5. Do not include markdown code blocks or backticks
+6. Generate ONLY SELECT queries (read-only)
+
+KPI FORMULA RULES (MANDATORY):
+1. Use EXACT formulas from business rules - DO NOT modify or substitute columns
+   Example: If business rule says "SUM(adjustments)", use EXACTLY that, NOT "SUM(contract_adjustment + non_contract_adjustment)"
+
+2. For Net Collection Rate (NCR):
+   REQUIRED FORMULA: (SUM(total_payment) / (SUM(charge) - SUM(adjustments))) * 100
+   DO NOT use variations like: contract_adjustment, non_contract_adjustment, or other adjustment columns
+
+3. For Gross Collection Rate (GCR):
+   REQUIRED FORMULA: (SUM(total_payment) / SUM(charge)) * 100
+
+4. For Days in AR:
+   REQUIRED FORMULA: SUM(balance) / (SUM(charge) / period_days)
+   Where period_days should be calculated from the actual date range in the query
+
+TIME-BASED QUERY REQUIREMENTS:
+1. If the description mentions "by month", "month-by-month", or a time range (e.g., "January to November"):
+   - ALWAYS include: GROUP BY EXTRACT(MONTH FROM visit_date), EXTRACT(YEAR FROM visit_date)
+   - ALWAYS select: EXTRACT(MONTH FROM visit_date) AS month, EXTRACT(YEAR FROM visit_date) AS year
+
+2. If the description mentions "by quarter":
+   - ALWAYS include: GROUP BY EXTRACT(QUARTER FROM visit_date), EXTRACT(YEAR FROM visit_date)
+
+3. If the description mentions "by year":
+   - ALWAYS include: GROUP BY EXTRACT(YEAR FROM visit_date)
+
+4. ALWAYS add ORDER BY for time dimensions to show chronological progression:
+   - ORDER BY year, month (for monthly data)
+   - ORDER BY year, quarter (for quarterly data)
+   - ORDER BY year (for yearly data)
+
+Generate a FOCUSED, SIMPLE query that answers ONLY this specific sub-query request.
+Keep it simple - this is just one piece of the larger analysis.
+"""
+
+                messages = [
+                    SystemMessage(content="You are a SQL expert. Generate focused, simple SQL queries. Return only the SQL, no explanations."),
+                    HumanMessage(content=multi_sql_prompt)
+                ]
+
+                response = self.llm.invoke(messages)
+                sql_query = response.content.strip()
+
+                # Clean up SQL (remove markdown formatting if present)
+                sql_query = sql_query.replace("```sql", "").replace("```", "").strip()
+
+                # Store SQL in the sub-query
+                sub_query["sql_query"] = sql_query
+                successful_count += 1
+
+                logger.info(f"✅ Generated SQL for {query_id}")
+                logger.info(f"SQL: {sql_query[:200]}...")
+
+                # Also print to console for visibility
+                print(f"\n{'='*70}")
+                print(f"✅ Generated SQL for {query_id}: {description}")
+                print(f"{'='*70}")
+                print(sql_query)
+                print(f"{'='*70}\n")
+
+            except Exception as e:
+                logger.error(f"❌ Failed to generate SQL for {query_id}: {e}")
+                sub_query["sql_query"] = None
+                sql_generation_errors.append({
+                    "query_id": query_id,
+                    "description": description,
+                    "error": str(e)
+                })
+
+        # Update state
+        state["query_plan"] = query_plan
+        state["sql_generation_errors"] = sql_generation_errors
+
+        # Log completion
+        total_queries = len(query_plan["sub_queries"])
+        failed_count = len(sql_generation_errors)
+
+        if successful_count > 0:
+            logger.info(f"\n✅ SQL generation complete: {successful_count}/{total_queries} succeeded")
+
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Generate Multi-Query SQL",
+                    status=StepStatus.COMPLETED,
+                    details=f"Generated SQL for {successful_count}/{total_queries} sub-queries",
+                    metadata={
+                        "successful_count": successful_count,
+                        "failed_count": failed_count,
+                        "total_queries": total_queries
+                    }
+                )
+        else:
+            logger.error("❌ Failed to generate SQL for all sub-queries")
+            state["error"] = "Failed to generate SQL for all sub-queries"
+
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Generate Multi-Query SQL",
+                    status=StepStatus.FAILED,
+                    details="Failed to generate SQL for all sub-queries"
+                )
+
+        return state
+
+    def execute_multi_query_node(self, state: AgentState) -> AgentState:
+        """
+        Execute multiple SQL queries in parallel with graceful degradation.
+
+        Queries are grouped by priority and executed in priority order.
+        Within each priority, queries run in parallel for performance.
+        Continues with partial results if some queries fail.
+        """
+        from utils.status_logger import StepStatus
+        import time
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        logger.info("Executing multi-query plan...")
+
+        # Log start
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Execute Multi-Query Plan",
+                status=StepStatus.RUNNING,
+                details="Executing SQL queries in parallel"
+            )
+
+        query_plan = state.get("query_plan")
+        if not query_plan or not query_plan.get("sub_queries"):
+            logger.error("No query plan available for execution")
+            state["error"] = "No query plan available"
+            return state
+
+        # Group queries by priority
+        queries_by_priority = {}
+        for sub_query in query_plan["sub_queries"]:
+            if sub_query.get("sql_query"):  # Only include queries with SQL
+                priority = sub_query.get("priority", 2)
+                if priority not in queries_by_priority:
+                    queries_by_priority[priority] = []
+                queries_by_priority[priority].append(sub_query)
+
+        # Initialize results tracking
+        multi_query_results = {}
+        successful_queries = []
+        failed_queries = []
+
+        def execute_single_query(sub_query):
+            """Execute a single sub-query and return results."""
+            query_id = sub_query["query_id"]
+            sql_query = sub_query["sql_query"]
+            start_time = time.time()
+
+            try:
+                logger.info(f"Executing {query_id}...")
+                result = self.catalog.execute_query(sql_query, timeout=60, max_rows=10000)
+
+                execution_time = time.time() - start_time
+
+                if result["success"]:
+                    logger.info(f"✅ {query_id} completed: {result['row_count']} rows in {execution_time:.2f}s")
+                    return {
+                        "query_id": query_id,
+                        "success": True,
+                        "rows": result.get("rows", []),
+                        "row_count": result.get("row_count", 0),
+                        "execution_time_seconds": execution_time,
+                        "error": None
+                    }
+                else:
+                    logger.error(f"❌ {query_id} failed: {result.get('error', 'Unknown error')}")
+                    return {
+                        "query_id": query_id,
+                        "success": False,
+                        "rows": None,
+                        "row_count": 0,
+                        "execution_time_seconds": execution_time,
+                        "error": result.get("error", "Unknown error")
+                    }
+
+            except Exception as e:
+                execution_time = time.time() - start_time
+                logger.error(f"❌ {query_id} exception: {e}")
+                return {
+                    "query_id": query_id,
+                    "success": False,
+                    "rows": None,
+                    "row_count": 0,
+                    "execution_time_seconds": execution_time,
+                    "error": str(e)
+                }
+
+        # Execute queries by priority (priority 1 first, then 2, then 3)
+        for priority in sorted(queries_by_priority.keys()):
+            queries = queries_by_priority[priority]
+            logger.info(f"\n{'='*70}")
+            logger.info(f"Executing Priority {priority} queries ({len(queries)} queries)")
+            logger.info(f"{'='*70}")
+
+            # Execute queries in parallel within this priority group
+            with ThreadPoolExecutor(max_workers=min(len(queries), 5)) as executor:
+                future_to_query = {executor.submit(execute_single_query, sq): sq for sq in queries}
+
+                for future in as_completed(future_to_query):
+                    result = future.result()
+                    query_id = result["query_id"]
+                    multi_query_results[query_id] = result
+
+                    if result["success"]:
+                        successful_queries.append(query_id)
+                    else:
+                        failed_queries.append(query_id)
+
+        # Update state
+        state["multi_query_results"] = multi_query_results
+        state["successful_queries"] = successful_queries
+        state["failed_queries"] = failed_queries
+
+        # Determine overall success
+        # Success if at least one priority 1 query succeeded
+        priority_1_queries = [sq["query_id"] for sq in query_plan["sub_queries"] if sq.get("priority") == 1]
+        priority_1_successes = [qid for qid in priority_1_queries if qid in successful_queries]
+
+        execution_success = len(priority_1_successes) > 0
+
+        state["execution_success"] = execution_success
+
+        # Log completion
+        total_queries = len(multi_query_results)
+        success_count = len(successful_queries)
+        failed_count = len(failed_queries)
+
+        logger.info(f"\n{'='*70}")
+        logger.info(f"Multi-Query Execution Complete")
+        logger.info(f"Total: {total_queries}, Succeeded: {success_count}, Failed: {failed_count}")
+        logger.info(f"{'='*70}")
+
+        if execution_success:
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Execute Multi-Query Plan",
+                    status=StepStatus.COMPLETED,
+                    details=f"Executed {success_count}/{total_queries} queries successfully",
+                    metadata={
+                        "total_queries": total_queries,
+                        "successful_count": success_count,
+                        "failed_count": failed_count,
+                        "successful_queries": successful_queries,
+                        "failed_queries": failed_queries
+                    }
+                )
+        else:
+            logger.error("❌ All critical (priority 1) queries failed")
+            state["error"] = "All critical queries failed"
+
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Execute Multi-Query Plan",
+                    status=StepStatus.FAILED,
+                    details="All critical (priority 1) queries failed"
+                )
+
+        return state
+
+    def synthesize_analytical_response_node(self, state: AgentState) -> AgentState:
+        """
+        Synthesize comprehensive analytical response from multiple query results.
+
+        Uses LLM to analyze all results and generate a narrative explanation
+        with specific numbers, trends, and data tables.
+        """
+        from utils.status_logger import StepStatus
+        import json
+
+        logger.info("Synthesizing analytical response...")
+
+        # Log start
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Synthesize Analytical Response",
+                status=StepStatus.RUNNING,
+                details="Combining query results into comprehensive narrative"
+            )
+
+        question = state["question"]
+        query_plan = state.get("query_plan", {})
+        multi_query_results = state.get("multi_query_results", {})
+        successful_queries = state.get("successful_queries", [])
+        failed_queries = state.get("failed_queries", [])
+
+        if not multi_query_results:
+            logger.error("No query results to synthesize")
+            state["answer"] = "I couldn't retrieve the necessary data to answer your question."
+            return state
+
+        # Format query results for LLM
+        formatted_results = []
+        for query_id in successful_queries:
+            result = multi_query_results[query_id]
+
+            # Find the sub-query description
+            sub_query = next((sq for sq in query_plan.get("sub_queries", []) if sq["query_id"] == query_id), None)
+            description = sub_query["description"] if sub_query else "Unknown"
+
+            # Limit rows to first 50 for LLM context
+            rows = result.get("rows", [])[:50]
+            row_count = result.get("row_count", 0)
+
+            formatted_results.append({
+                "query_id": query_id,
+                "description": description,
+                "row_count": row_count,
+                "rows_shown": len(rows),
+                "data": rows
+            })
+
+        # Build synthesis prompt
+        synthesis_prompt = f"""You are an expert data analyst. Analyze the following query results and provide a comprehensive answer to the user's question.
+
+ORIGINAL QUESTION: "{question}"
+
+ANALYTICAL CONTEXT:
+- Pattern: {query_plan.get('analytical_pattern', 'unknown')}
+- KPIs: {', '.join(query_plan.get('detected_kpis', []))}
+- Timeframes: {', '.join(query_plan.get('detected_timeframes', []))}
+
+QUERY PLAN REASONING:
+{chr(10).join(f"• {r}" for r in query_plan.get('reasoning', ['No reasoning provided']))}
+
+QUERY RESULTS:
+{json.dumps(formatted_results, indent=2, default=str)}
+
+STATUS:
+- Successful queries: {len(successful_queries)}/{len(multi_query_results)}
+- Failed queries: {len(failed_queries)}
+{f"- Note: Some queries failed: {', '.join(failed_queries)}" if failed_queries else ""}
+
+YOUR TASK:
+Generate a comprehensive analytical response that:
+
+1. **NARRATIVE EXPLANATION (2-3 paragraphs)**:
+   - Answer the question directly with specific insights
+   - Explain trends, causes, or correlations found in the data
+   - Cite SPECIFIC NUMBERS from the results (don't just say "increased", say "increased from X to Y")
+   - Connect multiple data points to tell a coherent story
+
+2. **KEY FINDINGS (Bullet Points)**:
+   - 3-5 most important insights with specific numbers
+   - Each finding should be actionable or meaningful
+
+3. **DATA TABLES (Markdown)**:
+   - Include relevant data tables to support your narrative
+   - Format as markdown tables
+   - Show key metrics and trends
+   - Limit to most relevant data (don't dump everything)
+
+OUTPUT FORMAT:
+Use markdown formatting. Structure your response as:
+
+## Analysis: [Brief Title]
+
+[2-3 paragraph narrative explanation with specific numbers]
+
+### Key Findings
+- [Finding 1 with specific numbers]
+- [Finding 2 with specific numbers]
+- [Finding 3 with specific numbers]
+
+### Supporting Data
+[Relevant markdown tables]
+
+CRITICAL RULES:
+- ALWAYS cite specific numbers from the data (e.g., "85.3%" not "around 85%")
+- Explain WHY changes occurred, don't just describe WHAT changed
+- If data is missing due to failed queries, acknowledge it briefly but focus on available data
+- Keep tables focused - show only the most relevant rows/columns
+- Use clear, professional language appropriate for business stakeholders
+
+Generate your comprehensive analytical response now:
+"""
+
+        try:
+            messages = [
+                SystemMessage(content="You are an expert data analyst. Provide comprehensive, data-driven analytical responses with specific numbers and clear explanations."),
+                HumanMessage(content=synthesis_prompt)
+            ]
+
+            response = self.llm.invoke(messages)
+            answer = response.content.strip()
+
+            state["answer"] = answer
+
+            logger.info("✅ Analytical response synthesized")
+            logger.info(f"Response length: {len(answer)} characters")
+
+            # Log completion
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Synthesize Analytical Response",
+                    status=StepStatus.COMPLETED,
+                    details="Generated comprehensive analytical response with narrative and data tables",
+                    metadata={
+                        "response_length": len(answer),
+                        "queries_synthesized": len(successful_queries),
+                        "failed_queries_count": len(failed_queries)
+                    }
+                )
+
+        except Exception as e:
+            logger.error(f"Error synthesizing response: {e}")
+
+            # Fallback: return raw data if synthesis fails
+            fallback_answer = f"## Query Results\n\n"
+            fallback_answer += f"I retrieved data for your question but encountered an error synthesizing the response.\n\n"
+
+            for result_info in formatted_results:
+                fallback_answer += f"### {result_info['description']}\n\n"
+                fallback_answer += f"Found {result_info['row_count']} rows\n\n"
+
+                if result_info['data']:
+                    # Simple table formatting
+                    first_row = result_info['data'][0]
+                    headers = list(first_row.keys())
+                    fallback_answer += "| " + " | ".join(headers) + " |\n"
+                    fallback_answer += "| " + " | ".join(["---"] * len(headers)) + " |\n"
+
+                    for row in result_info['data'][:10]:
+                        fallback_answer += "| " + " | ".join(str(row.get(h, "")) for h in headers) + " |\n"
+
+                    fallback_answer += "\n"
+
+            state["answer"] = fallback_answer
+            state["error"] = f"Synthesis failed: {str(e)}"
+
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Synthesize Analytical Response",
+                    status=StepStatus.FAILED,
+                    details=f"Synthesis error: {str(e)}, using fallback format"
+                )
 
         return state
 
@@ -1439,6 +2385,38 @@ Provide a clear, concise answer that:
         if state.get("needs_clarification", False):
             return "clarify"  # Return clarification question to user
         return "proceed"  # Continue with SQL generation
+
+    def route_query_strategy(self, state: AgentState) -> str:
+        """Route between single-query and multi-query analytical strategy."""
+        if state.get("is_analytical_query", False):
+            logger.info("📊 Routing to MULTI-QUERY analytical path")
+            return "plan_multi_query"
+        logger.info("📝 Routing to SINGLE-QUERY path")
+        return "generate_sql"
+
+    def check_query_plan(self, state: AgentState) -> str:
+        """Check if query planning succeeded."""
+        if state.get("query_plan") and state.get("query_plan").get("sub_queries"):
+            return "proceed"
+        return "error"
+
+    def check_multi_sql_generated(self, state: AgentState) -> str:
+        """Check if at least one sub-query has SQL generated."""
+        query_plan = state.get("query_plan", {})
+        sub_queries = query_plan.get("sub_queries", [])
+
+        # Check if at least one sub-query has SQL
+        has_sql = any(sq.get("sql_query") for sq in sub_queries)
+
+        if has_sql:
+            return "proceed"
+        return "error"
+
+    def check_multi_execution(self, state: AgentState) -> str:
+        """Check if at least one query executed successfully."""
+        if state.get("execution_success", False):
+            return "synthesize"
+        return "error"
 
     def check_sql_generated(self, state: AgentState) -> str:
         """Check if SQL was generated successfully."""
