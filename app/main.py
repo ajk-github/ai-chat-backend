@@ -1,5 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, field_validator
 from typing import Dict, Any, Optional, List
 from uuid import uuid4, UUID
@@ -490,6 +491,9 @@ async def chat(request: Request, req: ChatRequest) -> Dict[str, Any]:
         return {
             "response": result.get("answer", ""),
             "messageId": str(uuid4()),
+            "reasoning_steps": result.get("reasoning_steps", []),  # Include agent reasoning
+            "sql_query": result.get("sql_query"),
+            "metadata": result.get("metadata", {}),
         }
     except HTTPException:
         raise
@@ -503,6 +507,214 @@ async def chat(request: Request, req: ChatRequest) -> Dict[str, Any]:
             manager.close_all_catalogs()
         except Exception as cleanup_err:
             logging.getLogger(__name__).warning(f"Error cleaning up manager resources: {cleanup_err}")
+
+
+@app.post("/api/chat/stream")
+@limiter.limit(RATE_LIMITS["chat_per_hour"])
+@limiter.limit(RATE_LIMITS["chat_per_day"])
+@limiter.limit(RATE_LIMITS["chat_burst"])
+async def chat_stream(request: Request, req: ChatRequest):
+    """
+    Streaming chat endpoint for AR analysis with real-time agent reasoning.
+
+    Returns Server-Sent Events (SSE) with:
+    - status events: Agent reasoning steps
+    - answer events: Final response
+    - done events: Completion signal
+    """
+    import json
+
+    # Sanitize user_id
+    user_id = sanitize_user_id(req.user_id)
+
+    # Verify chat ownership
+    if not await verify_chat_ownership(req.chat_id, user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Chat does not belong to user"
+        )
+
+    base_data_dir = get_user_base_dir(user_id)
+    manager = ChatDataManager(base_data_dir=base_data_dir)
+
+    async def event_generator():
+        """Generate SSE events for streaming response."""
+        status_queue = asyncio.Queue()
+        result_container = {}
+
+        # Capture the running event loop (more reliable in async context)
+        loop = asyncio.get_running_loop()
+
+        def status_callback(status_data: Dict[str, Any]):
+            """Sync callback that puts status updates in queue (called from agent thread)."""
+            try:
+                # Use captured loop to safely add to queue from sync thread
+                loop.call_soon_threadsafe(
+                    status_queue.put_nowait, status_data
+                )
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Error in status callback: {e}", exc_info=True)
+
+        async def run_agent():
+            """Run agent in background thread."""
+            try:
+                logging.getLogger(__name__).info(f"Starting AR chat agent for chat {req.chat_id}")
+
+                # Persist user message to Firestore
+                try:
+                    fb = FirebaseService()
+                    await asyncio.to_thread(
+                        fb.add_message,
+                        req.chat_id,
+                        user_id,
+                        'user',
+                        req.message,
+                    )
+                    logging.getLogger(__name__).info(f"User message persisted to Firestore")
+                except Exception as fb_err:
+                    logging.getLogger(__name__).error(f"Firebase user message write failed: {fb_err}")
+
+                # Retrieve chat history
+                chat_history = []
+                try:
+                    messages = await asyncio.to_thread(fb.get_chat_messages, req.chat_id)
+                    chat_history = [
+                        {"role": msg["role"], "content": msg["content"]}
+                        for msg in messages
+                        if msg["role"] in ["user", "assistant"]
+                    ]
+                except Exception as fb_err:
+                    logging.getLogger(__name__).warning(f"Failed to retrieve chat history: {fb_err}")
+
+                # Get catalog and agent
+                logging.getLogger(__name__).info(f"Getting catalog for chat {req.chat_id}")
+                catalog = manager.get_chat_catalog(req.chat_id)
+                processed_dir = get_processed_dir(user_id, req.chat_id)
+                openai_api_key = os.getenv("OPENAI_API_KEY", "")
+
+                if not openai_api_key:
+                    result_container['error'] = 'OPENAI_API_KEY not configured'
+                    return
+
+                # Create agent
+                logging.getLogger(__name__).info(f"Creating DataQueryAgent")
+                from agents.data_query_agent import DataQueryAgent
+                agent = DataQueryAgent(
+                    duckdb_catalog=catalog,
+                    openai_api_key=openai_api_key,
+                    schema_profiles_dir=processed_dir,
+                )
+
+                # Process question in thread (agent.ask is sync, callback will send updates)
+                logging.getLogger(__name__).info(f"Calling agent.ask() with question: {req.message}")
+                result = await asyncio.to_thread(agent.ask, req.message, chat_history, status_callback)
+                logging.getLogger(__name__).info(f"Agent.ask() completed successfully")
+
+                # Store result
+                result_container['result'] = result
+
+                # Persist assistant response
+                try:
+                    await asyncio.to_thread(
+                        fb.add_message,
+                        req.chat_id,
+                        user_id,
+                        'assistant',
+                        result.get("answer", ""),
+                    )
+                except Exception as fb_err:
+                    logging.getLogger(__name__).error(f"Firebase response write failed: {fb_err}")
+
+            except Exception as e:
+                result_container['error'] = str(e)
+                logging.getLogger(__name__).error(f"Agent error: {e}", exc_info=True)
+            finally:
+                # Signal completion
+                await status_queue.put(None)
+
+        agent_task = None
+        try:
+            # Send initial connection established message
+            yield ": connected\n\n"
+            await asyncio.sleep(0)
+
+            # Start agent in background
+            agent_task = asyncio.create_task(run_agent())
+
+            # Stream status updates as they arrive
+            while True:
+                try:
+                    # Wait for status update with timeout
+                    status_data = await asyncio.wait_for(status_queue.get(), timeout=0.5)
+
+                    if status_data is None:
+                        # Agent completed
+                        break
+
+                    # Send status update
+                    yield f"data: {json.dumps(status_data)}\n\n"
+                    # Give control back to event loop
+                    await asyncio.sleep(0)
+
+                except asyncio.TimeoutError:
+                    # No status update, continue waiting
+                    # Check if agent task is still running
+                    if agent_task and agent_task.done():
+                        # Agent finished without putting None in queue
+                        break
+                    # Send keep-alive comment to prevent connection timeout
+                    yield ": keep-alive\n\n"
+                    await asyncio.sleep(0)
+                    continue
+
+            # Wait for agent to complete
+            if agent_task and not agent_task.done():
+                await agent_task
+
+            # Check for errors
+            if 'error' in result_container:
+                yield f"data: {json.dumps({'error': result_container['error']})}\n\n"
+                return
+
+            # Send final answer
+            result = result_container.get('result', {})
+            yield f"data: {json.dumps({'answer': result.get('answer', ''), 'sql_query': result.get('sql_query'), 'metadata': result.get('metadata', {})})}\n\n"
+
+            # Send done signal
+            yield f"data: {json.dumps({'success': result.get('success', False)})}\n\n"
+
+        except (asyncio.CancelledError, GeneratorExit):
+            # Client disconnected, cancel the agent task
+            if agent_task and not agent_task.done():
+                agent_task.cancel()
+                try:
+                    await agent_task
+                except asyncio.CancelledError:
+                    pass
+            raise
+        except Exception as e:
+            error_msg = str(e)
+            logging.getLogger(__name__).error(f"Stream error: {e}", exc_info=True)
+            try:
+                yield f"data: {json.dumps({'error': error_msg})}\n\n"
+            except:
+                pass  # Can't send error if stream is broken
+        finally:
+            # Cleanup manager resources
+            try:
+                manager.close_all_catalogs()
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable proxy buffering
+        }
+    )
 
 
 @app.delete("/api/chat/delete/{chat_id}")
@@ -782,6 +994,136 @@ async def db_chat(request: Request, req: DatabaseChatRequest) -> Dict[str, Any]:
                 detail=f"Failed to process database chat request: {error_msg}\n{traceback.format_exc()}"
             )
         raise HTTPException(status_code=500, detail=f"Failed to process database chat request: {error_msg}")
+
+
+@app.post("/api/db/chat/stream")
+@limiter.limit(RATE_LIMITS["chat_per_hour"])
+@limiter.limit(RATE_LIMITS["chat_per_day"])
+@limiter.limit(RATE_LIMITS["chat_burst"])
+async def db_chat_stream(request: Request, req: DatabaseChatRequest):
+    """
+    Streaming chat endpoint for database queries with real-time agent reasoning.
+
+    Returns Server-Sent Events (SSE) with:
+    - status events: Agent reasoning steps
+    - answer events: Final response
+    - done events: Completion signal
+    """
+    import json
+    from utils.status_logger import StatusLogger
+
+    # Sanitize user_id
+    user_id = sanitize_user_id(req.user_id)
+
+    # Verify chat ownership
+    if not await verify_chat_ownership(req.chat_id, user_id):
+        raise HTTPException(
+            status_code=403,
+            detail="Access denied: Chat does not belong to user"
+        )
+
+    async def event_generator():
+        """Generate SSE events for streaming response."""
+        try:
+            # Persist user message to Firestore
+            try:
+                fb = FirebaseService()
+                await asyncio.to_thread(
+                    fb.add_message,
+                    req.chat_id,
+                    user_id,
+                    'user',
+                    req.message,
+                )
+            except Exception as fb_err:
+                logging.getLogger(__name__).error(f"Firebase user message write failed: {fb_err}")
+
+            # Retrieve chat history
+            chat_history = []
+            try:
+                messages = await asyncio.to_thread(fb.get_chat_messages, req.chat_id)
+                chat_history = [
+                    {"role": msg["role"], "content": msg["content"]}
+                    for msg in messages
+                    if msg["role"] in ["user", "assistant"]
+                ]
+            except Exception as fb_err:
+                logging.getLogger(__name__).warning(f"Failed to retrieve chat history: {fb_err}")
+
+            # Get MySQL catalog
+            try:
+                catalog = get_mysql_catalog_for_database(req.database)
+            except ValueError as e:
+                yield f"data: {json.dumps({'error': f'Database configuration error: {str(e)}'})}\n\n"
+                return
+            except Exception as e:
+                logging.getLogger(__name__).error(f"Error getting database catalog: {e}", exc_info=True)
+                yield f"data: {json.dumps({'error': f'Failed to connect to database: {str(e)}'})}\n\n"
+                return
+
+            # Get OpenAI API key
+            openai_api_key = os.getenv("OPENAI_API_KEY", "")
+            if not openai_api_key:
+                yield f"data: {json.dumps({'error': 'OPENAI_API_KEY not configured'})}\n\n"
+                return
+
+            # Create status callback for streaming
+            async def status_callback(status_data: Dict[str, Any]):
+                """Send status updates as SSE events."""
+                yield f"data: {json.dumps(status_data)}\n\n"
+
+            # Create database query agent
+            from agents.database_query_agent import DatabaseQueryAgent
+            agent = DatabaseQueryAgent(
+                mysql_catalog=catalog,
+                openai_api_key=openai_api_key,
+            )
+
+            # Process the question with status streaming
+            result = await agent.ask(
+                req.message,
+                chat_history,
+                status_callback=status_callback
+            )
+
+            # Send status updates as they come
+            if result.get("reasoning_steps"):
+                for step in result["reasoning_steps"]:
+                    yield f"data: {json.dumps(step)}\n\n"
+                    await asyncio.sleep(0.01)  # Small delay for smoother streaming
+
+            # Persist assistant response
+            try:
+                await asyncio.to_thread(
+                    fb.add_message,
+                    req.chat_id,
+                    user_id,
+                    'assistant',
+                    result.get("answer", ""),
+                )
+            except Exception as fb_err:
+                logging.getLogger(__name__).error(f"Firebase response write failed: {fb_err}")
+
+            # Send final answer
+            yield f"data: {json.dumps({'answer': result.get('answer', ''), 'sql_query': result.get('sql_query'), 'metadata': result.get('metadata', {})})}\n\n"
+
+            # Send done signal
+            yield f"data: {json.dumps({'success': result.get('success', False)})}\n\n"
+
+        except Exception as e:
+            error_msg = str(e)
+            logging.getLogger(__name__).error(f"Stream error: {e}", exc_info=True)
+            yield f"data: {json.dumps({'error': error_msg})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",  # Disable proxy buffering
+        }
+    )
 
 
 @app.get("/health")

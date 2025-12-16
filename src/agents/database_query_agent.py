@@ -58,6 +58,9 @@ class AgentState(TypedDict):
     retry_count: int
     max_retries: int
 
+    # Status logging
+    status_logger: Optional[Any]  # StatusLogger instance
+
 
 # ===== Agent Class =====
 
@@ -439,7 +442,22 @@ class DatabaseQueryAgent:
 
     def load_schema_node(self, state: AgentState) -> AgentState:
         """Load schema information for relevant tables."""
+        from utils.status_logger import StepStatus
+
         logger.info("Loading schema context...")
+
+        # Log status
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Load Schema",
+                status=StepStatus.RUNNING,
+                details=f"Loading database schema and table information",
+                reasoning=[
+                    "Connecting to MySQL database",
+                    "Retrieving list of available tables",
+                    "Extracting column information for SQL generation"
+                ]
+            )
 
         # Ensure schema cache is loaded (async, but we'll handle it in execute_query)
         # For now, get tables from cache
@@ -462,14 +480,14 @@ class DatabaseQueryAgent:
                 key = col.get("key", "")
 
                 col_desc = f"    - {col_name} ({col_type})"
-                
+
                 if key == "PRI":
                     col_desc += " - PRIMARY KEY"
                 elif key == "MUL":
                     col_desc += " - INDEXED"
                 elif key == "UNI":
                     col_desc += " - UNIQUE"
-                
+
                 if not nullable:
                     col_desc += " - NOT NULL"
 
@@ -483,6 +501,24 @@ class DatabaseQueryAgent:
         state["schema_context"] = schema_context
 
         logger.info(f"Loaded schema for {len(tables)} tables")
+
+        # Complete status
+        if state.get("status_logger"):
+            table_list = ", ".join(tables[:5])
+            if len(tables) > 5:
+                table_list += f", ... ({len(tables)-5} more)"
+
+            state["status_logger"].log_step(
+                step_name="Load Schema",
+                status=StepStatus.COMPLETED,
+                details=f"Loaded schema for {len(tables)} tables",
+                reasoning=[
+                    f"Found {len(tables)} tables in database",
+                    f"Tables: {table_list}",
+                    "Schema context ready for SQL generation"
+                ],
+                metadata={"table_count": len(tables), "tables": tables}
+            )
 
         return state
 
@@ -516,7 +552,22 @@ class DatabaseQueryAgent:
 
     def generate_sql_node(self, state: AgentState) -> AgentState:
         """Generate SQL query from natural language."""
+        from utils.status_logger import StepStatus
+
         logger.info("Generating SQL query...")
+
+        # Log status
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Generate SQL",
+                status=StepStatus.RUNNING,
+                details="Converting natural language question to SQL query",
+                reasoning=[
+                    f"Question: {state['question']}",
+                    "Using schema context and business rules",
+                    "Applying query examples for better SQL generation"
+                ]
+            )
         
         # Get error message for prompt BEFORE clearing it (for retry detection)
         error_msg = state.get('validation_error') or state.get('execution_error') or 'N/A'
@@ -696,10 +747,32 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
 
             logger.info(f"Generated SQL: {sql_query}")
 
+            # Log completion
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Generate SQL",
+                    status=StepStatus.COMPLETED,
+                    details=f"SQL query generated successfully",
+                    reasoning=[
+                        f"Generated SQL: {sql_query[:200]}{'...' if len(sql_query) > 200 else ''}",
+                        "Ready for validation and execution"
+                    ],
+                    metadata={"sql_query": sql_query}
+                )
+
         except Exception as e:
             logger.error(f"Error generating SQL: {e}")
             state["sql_query"] = None
             state["execution_error"] = f"Failed to generate SQL: {str(e)}"
+
+            # Log failure
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Generate SQL",
+                    status=StepStatus.FAILED,
+                    details=f"Failed to generate SQL query",
+                    reasoning=[f"Error: {str(e)}"]
+                )
 
         return state
 
@@ -731,6 +804,8 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
 
     def execute_query_node(self, state: AgentState) -> AgentState:
         """Execute validated SQL query."""
+        from utils.status_logger import StepStatus
+
         logger.info("Executing SQL query...")
 
         sql_query = state.get("sql_query")
@@ -739,6 +814,18 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
             state["execution_success"] = False
             state["execution_error"] = "No SQL query to execute"
             return state
+
+        # Log execution start
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Execute Query",
+                status=StepStatus.RUNNING,
+                details="Executing SQL query against MySQL database",
+                reasoning=[
+                    f"Running query: {sql_query[:150]}{'...' if len(sql_query) > 150 else ''}",
+                    "Fetching results from database"
+                ]
+            )
 
         try:
             # Execute query (async, but we're in a sync node)
@@ -827,16 +914,53 @@ If validation or execution failed previously, fix this error: {error_msg}{error_
             if not result["success"]:
                 state["execution_error"] = result.get("error", "Unknown execution error")
                 logger.error(f"Query execution failed: {state['execution_error']}")
+
+                # Log failure
+                if state.get("status_logger"):
+                    state["status_logger"].log_step(
+                        step_name="Execute Query",
+                        status=StepStatus.FAILED,
+                        details=f"Query execution failed",
+                        reasoning=[f"Error: {state['execution_error']}"],
+                        metadata={"error": state["execution_error"]}
+                    )
             else:
                 logger.info(
                     f"Query executed successfully: {result['row_count']} rows "
                     f"in {result.get('execution_time_seconds', 0):.3f}s"
                 )
 
+                # Log success
+                if state.get("status_logger"):
+                    state["status_logger"].log_step(
+                        step_name="Execute Query",
+                        status=StepStatus.COMPLETED,
+                        details=f"Query returned {result['row_count']:,} rows in {result.get('execution_time_seconds', 0):.3f}s",
+                        reasoning=[
+                            f"✓ Query executed successfully",
+                            f"Rows returned: {result['row_count']:,}",
+                            f"Execution time: {result.get('execution_time_seconds', 0):.3f}s"
+                        ],
+                        metadata={
+                            "row_count": result['row_count'],
+                            "execution_time_seconds": result.get('execution_time_seconds', 0),
+                            "column_names": result.get('column_names', [])
+                        }
+                    )
+
         except Exception as e:
             state["execution_success"] = False
             state["execution_error"] = str(e)
             logger.error(f"Error executing query: {e}")
+
+            # Log exception
+            if state.get("status_logger"):
+                state["status_logger"].log_step(
+                    step_name="Execute Query",
+                    status=StepStatus.FAILED,
+                    details=f"Exception during query execution",
+                    reasoning=[f"Error: {str(e)}"]
+                )
 
         return state
 
@@ -1043,7 +1167,8 @@ Provide a clear, concise answer that:
     async def ask(
         self,
         question: str,
-        chat_history: List[Dict[str, str]] = None
+        chat_history: List[Dict[str, str]] = None,
+        status_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         Process a natural language question and return an answer.
@@ -1051,12 +1176,18 @@ Provide a clear, concise answer that:
         Args:
             question: Natural language question
             chat_history: Previous conversation messages
+            status_callback: Optional callback for real-time status updates
 
         Returns:
-            Dictionary with answer and metadata
+            Dictionary with answer, metadata, and reasoning_steps
         """
+        from utils.status_logger import StatusLogger
+
         if chat_history is None:
             chat_history = []
+
+        # Create StatusLogger with callback
+        status_logger = StatusLogger(callback=status_callback)
 
         # Ensure schema is loaded (async)
         await self.catalog._load_schema_cache()
@@ -1078,17 +1209,23 @@ Provide a clear, concise answer that:
             "metadata": {},
             "retry_count": 0,
             "max_retries": self.max_retries,
+            "status_logger": status_logger,  # Add StatusLogger to state
         }
 
         try:
             # Run graph (synchronous, but execute_query_node handles async internally)
             result_state = self.graph.invoke(initial_state)
-            
+
+            # Get status summary
+            status_summary = status_logger.get_summary()
+
             return {
                 "answer": result_state.get("answer", ""),
                 "metadata": result_state.get("metadata", {}),
                 "sql_query": result_state.get("sql_query"),
                 "success": result_state.get("execution_success", False),
+                "reasoning_steps": status_summary["steps"],  # Include reasoning
+                "total_time": status_summary["total_time_seconds"]
             }
 
         except Exception as e:
@@ -1100,13 +1237,17 @@ Provide a clear, concise answer that:
                     "metadata": {"error": str(e)},
                     "sql_query": None,
                     "success": False,
+                    "reasoning_steps": status_logger.get_summary()["steps"],
+                    "total_time": status_logger.get_summary()["total_time_seconds"]
                 }
-            
+
             logger.error(f"Error in ask(): {e}", exc_info=True)
             return {
                 "answer": "I encountered an issue processing your question. Please try again.",
                 "metadata": {"error": str(e)},
                 "sql_query": None,
                 "success": False,
+                "reasoning_steps": status_logger.get_summary()["steps"],
+                "total_time": status_logger.get_summary()["total_time_seconds"]
             }
 

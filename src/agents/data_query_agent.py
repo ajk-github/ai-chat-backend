@@ -75,6 +75,9 @@ class AgentState(TypedDict):
     # Denial analysis
     is_denial_analysis: bool
 
+    # Status logging
+    status_logger: Optional[Any]  # StatusLogger instance
+
 
 # ===== Agent Class =====
 
@@ -366,32 +369,84 @@ class DataQueryAgent:
         reasoning.append(f"📝 Original question: '{question}'")
 
         # Pattern 1: Definition/Terminology questions
-        definition_patterns = [
-            r'^what\s+(is|does|means?)\s+(\w+)',
-            r'^define\s+(\w+)',
-            r'^explain\s+(\w+)',
-            r'^(\w+)\s+definition',
-            r'^(\w+)\s+meaning'
+        # Check if this is ACTUALLY a definition question (not a data query with year/date)
+
+        import re
+
+        # First, check if the question contains contextual indicators that make it a DATA query
+        data_query_indicators = [
+            r'for\s+(the\s+)?(year|month|quarter|week|day)',  # "for the year 2025"
+            r'in\s+\d{4}',  # "in 2025"
+            r'for\s+\d{4}',  # "for 2025"
+            r'during\s+\d{4}',  # "during 2025"
+            r'this\s+(year|month|quarter)',  # "this year"
+            r'last\s+(year|month|quarter)',  # "last year"
+            r'from\s+\d{4}',  # "from 2025"
+            r'between\s+',  # "between 2024 and 2025"
         ]
 
-        for pattern in definition_patterns:
-            import re
-            match = re.search(pattern, question_lower)
-            if match:
-                # Extract the term being asked about
-                term = match.groups()[-1].upper()  # Get the last capturing group, uppercase
+        is_data_query_context = any(re.search(indicator, question_lower) for indicator in data_query_indicators)
 
-                reasoning.append(f"🔍 Detected: This is a DEFINITION question about '{term}'")
+        if is_data_query_context:
+            reasoning.append(f"🔍 Detected contextual indicators (year/date) - this is a DATA QUERY, not a definition")
+        else:
+            # Now check if it's a definition question
+            definition_patterns = [
+                r'^what\s+(is|does|are|means?)\s+(the\s+)?([a-z\s]+?)(\?|$)',  # "what is net collection rate?"
+                r'^define\s+([a-z\s]+?)(\?|$)',  # "define net collection rate"
+                r'^explain\s+([a-z\s]+?)(\?|$)',  # "explain net collection rate"
+                r'^([a-z\s]+?)\s+definition',  # "net collection rate definition"
+                r'^([a-z\s]+?)\s+meaning',  # "net collection rate meaning"
+            ]
 
-                # Check if it's an acronym we know
-                if term in terminology:
-                    detected_acronyms.append(term)
-                    full_term = terminology[term]
-                    reasoning.append(f"✓ Found acronym: {term} = {full_term}")
+            for pattern in definition_patterns:
+                match = re.search(pattern, question_lower)
+                if match:
+                    # Extract the term being asked about (last captured group before ? or end)
+                    captured_groups = match.groups()
+                    # Get the actual term (skip 'the' and other determiners)
+                    term_raw = captured_groups[-2] if len(captured_groups) > 1 else captured_groups[-1]
+                    term = term_raw.strip().upper()
 
-                    # Check if it's also a KPI
+                    reasoning.append(f"🔍 Detected: This is a DEFINITION question about '{term}'")
+
+                    # Check if it's an acronym we know
+                    if term in terminology:
+                        detected_acronyms.append(term)
+                        full_term = terminology[term]
+                        reasoning.append(f"✓ Found acronym: {term} = {full_term}")
+
+                        # Check if it's also a KPI
+                        for kpi_name, kpi_info in kpi_definitions.items():
+                            if term in kpi_name.upper() or kpi_name.upper() in term:
+                                reasoning.append(f"📊 This is a KPI metric: {kpi_name}")
+                                reasoning.append(f"   Formula: {kpi_info['formula']}")
+
+                                return {
+                                    "interpreted_question": f"Explain the {kpi_name} metric and its calculation",
+                                    "question_type": "kpi_definition",
+                                    "detected_acronyms": detected_acronyms,
+                                    "reasoning": reasoning,
+                                    "kpi_name": kpi_name,
+                                    "kpi_info": kpi_info
+                                }
+
+                        return {
+                            "interpreted_question": f"Explain what {term} ({full_term}) means",
+                            "question_type": "terminology_definition",
+                            "detected_acronyms": detected_acronyms,
+                            "reasoning": reasoning,
+                            "term": term,
+                            "definition": full_term
+                        }
+
+                    # Even if not in terminology dict, check KPI definitions by matching the full phrase
+                    term_lower = term_raw.strip().lower()
                     for kpi_name, kpi_info in kpi_definitions.items():
-                        if term in kpi_name.upper() or kpi_name.upper() in term:
+                        # Check if the asked term matches the KPI name
+                        kpi_name_lower = kpi_name.lower()
+                        # Match if term is in KPI name or vice versa
+                        if term_lower in kpi_name_lower or kpi_name_lower in term_lower:
                             reasoning.append(f"📊 This is a KPI metric: {kpi_name}")
                             reasoning.append(f"   Formula: {kpi_info['formula']}")
 
@@ -403,15 +458,6 @@ class DataQueryAgent:
                                 "kpi_name": kpi_name,
                                 "kpi_info": kpi_info
                             }
-
-                    return {
-                        "interpreted_question": f"Explain what {term} ({full_term}) means",
-                        "question_type": "terminology_definition",
-                        "detected_acronyms": detected_acronyms,
-                        "reasoning": reasoning,
-                        "term": term,
-                        "definition": full_term
-                    }
 
         # Pattern 2: Data queries with acronyms - expand them for better SQL generation
         expanded_question = question
@@ -743,9 +789,24 @@ class DataQueryAgent:
         - Shows reasoning steps (verbose logging)
         - Handles definition questions without SQL
         """
+        from utils.status_logger import StepStatus
+
         logger.info("=" * 80)
         logger.info("🧠 QUESTION INTERPRETATION PHASE")
         logger.info("=" * 80)
+
+        # Log to status
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Interpret Question",
+                status=StepStatus.RUNNING,
+                details="Analyzing question to understand user intent",
+                reasoning=[
+                    f"Question: {state['question']}",
+                    "Checking if this is a definition or data query",
+                    "Detecting acronyms and expanding them"
+                ]
+            )
 
         # Interpret the question
         interpretation = self._interpret_question(state["question"])
@@ -763,6 +824,20 @@ class DataQueryAgent:
 
         logger.info(f"\n🎯 Question Type: {interpretation['question_type']}")
         logger.info(f"📝 Interpreted Question: {interpretation['interpreted_question']}")
+
+        # Log completion
+        if state.get("status_logger"):
+            state["status_logger"].log_step(
+                step_name="Interpret Question",
+                status=StepStatus.COMPLETED,
+                details=f"Identified as: {interpretation['question_type']}",
+                reasoning=interpretation["reasoning"],
+                metadata={
+                    "question_type": interpretation["question_type"],
+                    "detected_acronyms": interpretation.get("detected_acronyms", []),
+                    "interpreted_question": interpretation["interpreted_question"]
+                }
+            )
 
         # Handle definition/terminology questions directly (no SQL needed)
         if interpretation["question_type"] == "kpi_definition":
@@ -1486,7 +1561,8 @@ Provide a clear, concise answer that:
     def ask(
         self,
         question: str,
-        chat_history: Optional[List[Dict[str, str]]] = None
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        status_callback: Optional[Any] = None
     ) -> Dict[str, Any]:
         """
         Ask a natural language question.
@@ -1494,10 +1570,23 @@ Provide a clear, concise answer that:
         Args:
             question: Natural language question
             chat_history: Previous chat messages
+            status_callback: Optional callback for real-time status updates
 
         Returns:
-            Dictionary with answer and metadata
+            Dictionary with answer, metadata, and reasoning_steps
         """
+        # Print to console for visibility
+        print("\n" + "=" * 80)
+        print("🚀 AR CHAT AGENT - Processing Question")
+        print("=" * 80)
+        print(f"Question: {question}")
+        print("=" * 80 + "\n")
+
+        from utils.status_logger import StatusLogger
+
+        # Create StatusLogger with callback
+        status_logger = StatusLogger(callback=status_callback)
+
         # Initialize state
         initial_state = {
             "question": question,
@@ -1516,7 +1605,8 @@ Provide a clear, concise answer that:
             "retry_count": 0,
             "max_retries": self.max_retries,
             "is_weekly_report": False,
-            "company_name": None
+            "company_name": None,
+            "status_logger": status_logger  # Add StatusLogger to state
         }
 
         # Run graph with recursion limit to prevent infinite loops
@@ -1529,6 +1619,7 @@ Provide a clear, concise answer that:
                            f"validation_error: {initial_state.get('validation_error')}, "
                            f"execution_error: {initial_state.get('execution_error')}")
                 # Return user-friendly error response
+                status_summary = status_logger.get_summary()
                 return {
                     "answer": "I don't understand your question. Please try to be more specific.",
                     "metadata": {
@@ -1537,7 +1628,9 @@ Provide a clear, concise answer that:
                         "retry_count": initial_state.get("retry_count", 0)
                     },
                     "sql_query": initial_state.get("sql_query"),
-                    "success": False
+                    "success": False,
+                    "reasoning_steps": status_summary["steps"],
+                    "total_time": status_summary["total_time_seconds"]
                 }
             raise
 
@@ -1550,12 +1643,26 @@ Provide a clear, concise answer that:
         elif not answer or not answer.strip():
             # No answer generated but query succeeded (shouldn't happen, but safety check)
             answer = "I don't understand your question. Please try to be more specific."
-        
+
+        # Get status summary
+        status_summary = status_logger.get_summary()
+
+        # Print completion message
+        print("\n" + "=" * 80)
+        print("✅ AR CHAT AGENT - Processing Complete")
+        print("=" * 80)
+        print(f"Total Time: {status_summary['total_time_seconds']:.2f}s")
+        print(f"Total Steps: {status_summary['total_steps']}")
+        print(f"Success: {final_state.get('execution_success', False)}")
+        print("=" * 80 + "\n")
+
         return {
             "answer": answer,
             "metadata": final_state.get("metadata", {}),
             "sql_query": final_state.get("sql_query"),
-            "success": final_state.get("execution_success", False)
+            "success": final_state.get("execution_success", False),
+            "reasoning_steps": status_summary["steps"],  # Include reasoning
+            "total_time": status_summary["total_time_seconds"]
         }
 
 
