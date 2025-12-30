@@ -1231,15 +1231,15 @@ class KPICalculator:
     def generate_weekly_comparison_report(self, company_name: str = "Company") -> Dict[str, Any]:
         """
         Generate a weekly comparison report showing metrics based on DOS (visit_date) vs Date Created (visit_created_date).
-        Shows data for the latest complete week only - single week, not past 5 weeks.
+        Shows data for the last 5 weeks (5 rows, each representing a 7-day week).
 
         Args:
             company_name: Name of the company for the report
 
         Returns:
-            Dictionary containing weekly comparison metrics with DOS and Date Created columns
+            Dictionary containing weekly comparison metrics with DOS and Date Created columns for 5 weeks
         """
-        logger.info(f"Generating weekly comparison report for {company_name}...")
+        logger.info(f"Generating weekly comparison report for {company_name} (last 5 weeks)...")
 
         df_copy = self.df.copy()
 
@@ -1265,92 +1265,133 @@ class KPICalculator:
                 "company": company_name,
                 "generated_at": datetime.now().isoformat(),
                 "error": "No date fields found in data.",
-                "weekly_comparison": {}
+                "weeks": []
             }
 
         try:
-            # Determine the latest week to show (based on whichever date column is available)
-            # Priority: visit_created_date for detecting latest data, fallback to visit_date
-            reference_col = visit_created_date_col if visit_created_date_col else visit_date_col
+            # Convert both date columns to datetime ONCE before the loop
+            if visit_date_col:
+                df_copy[visit_date_col] = pd.to_datetime(df_copy[visit_date_col], errors='coerce')
+            if visit_created_date_col:
+                df_copy[visit_created_date_col] = pd.to_datetime(df_copy[visit_created_date_col], errors='coerce')
 
-            df_copy[reference_col] = pd.to_datetime(df_copy[reference_col], errors='coerce')
-            df_copy = df_copy[df_copy[reference_col].notna()]
-
-            if df_copy.empty:
+            # IMPORTANT: Use visit_date (DOS) to determine week boundaries
+            # Both DOS and Date Created will use the SAME week boundaries (based on DOS)
+            # but filter by their respective date columns
+            if not visit_date_col:
                 return {
                     "company": company_name,
                     "generated_at": datetime.now().isoformat(),
-                    "error": "No valid dates found in data.",
-                    "weekly_comparison": {}
+                    "error": "visit_date column not found - cannot calculate DOS weeks.",
+                    "weeks": []
                 }
 
-            # Get the latest week (7 days ending on the most recent date)
-            latest_date = df_copy[reference_col].max()
-            week_end = latest_date
-            week_start = latest_date - timedelta(days=6)  # 7 days total
+            # Get the latest visit_date (DOS) to determine week boundaries
+            latest_date = df_copy[visit_date_col].max()
 
-            logger.info(f"Latest week: {week_start.date()} to {week_end.date()}")
+            if pd.isna(latest_date):
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No valid visit_date found in data.",
+                    "weeks": []
+                }
 
-            # --- Calculate DOS Metrics (using visit_date) ---
-            collections_dos = 0.0
-            charges_dos = 0.0
-            visits_dos = 0
-
-            if visit_date_col:
-                df_copy[visit_date_col] = pd.to_datetime(df_copy[visit_date_col], errors='coerce')
-                df_dos = df_copy[
-                    (df_copy[visit_date_col].notna()) &
-                    (df_copy[visit_date_col] >= week_start) &
-                    (df_copy[visit_date_col] <= week_end)
-                ]
-
-                visits_dos = len(df_dos) if not df_dos.empty else 0
-
-                dos_calc = KPICalculator(df_dos) if not df_dos.empty else None
-                collections_dos = dos_calc._calculate_filtered_payments() if dos_calc else 0.0
-                charges_dos = dos_calc._calculate_filtered_charges() if dos_calc else 0.0
-
-                logger.info(f"DOS metrics: {visits_dos} visits, ${collections_dos:,.2f} collections, ${charges_dos:,.2f} charges")
+            # Find the most recent complete Sunday (end of last complete week)
+            # weekday(): Monday=0, Sunday=6
+            days_since_sunday = (latest_date.weekday() + 1) % 7
+            if days_since_sunday == 0:
+                # Latest date IS a Sunday
+                last_complete_sunday = latest_date
             else:
-                logger.warning("visit_date column not found - DOS metrics will be 0")
+                # Go back to the previous Sunday
+                last_complete_sunday = latest_date - timedelta(days=days_since_sunday)
 
-            # --- Calculate Date Created Metrics (using visit_created_date) ---
-            collections_dc = 0.0
-            charges_dc = 0.0
-            visits_dc = 0
+            logger.info(f"Latest date: {latest_date.date()}, Last complete Sunday: {last_complete_sunday.date()}")
 
-            if visit_created_date_col:
-                df_copy[visit_created_date_col] = pd.to_datetime(df_copy[visit_created_date_col], errors='coerce')
-                df_dc = df_copy[
-                    (df_copy[visit_created_date_col].notna()) &
-                    (df_copy[visit_created_date_col] >= week_start) &
-                    (df_copy[visit_created_date_col] <= week_end)
-                ]
+            # Calculate last 5 complete weeks (Monday-Sunday)
+            weeks_data = []
 
-                visits_dc = len(df_dc) if not df_dc.empty else 0
+            for week_offset in range(5):  # 0 = most recent complete week, 4 = 5th week back
+                # Calculate week boundaries (Monday to Sunday)
+                week_end = last_complete_sunday - timedelta(days=7 * week_offset)  # Sunday
+                week_start = week_end - timedelta(days=6)  # Monday (7 days total)
 
-                dc_calc = KPICalculator(df_dc) if not df_dc.empty else None
-                collections_dc = dc_calc._calculate_filtered_payments() if dc_calc else 0.0
-                charges_dc = dc_calc._calculate_filtered_charges() if dc_calc else 0.0
+                logger.info(f"Week {week_offset + 1}: {week_start.date()} (Mon) to {week_end.date()} (Sun)")
 
-                logger.info(f"Date Created metrics: {visits_dc} visits, ${collections_dc:,.2f} collections, ${charges_dc:,.2f} charges")
-            else:
-                logger.warning("visit_created_date column not found - Date Created metrics will be 0")
+                # --- Calculate DOS Metrics (using visit_date) ---
+                collections_dos = 0.0
+                charges_dos = 0.0
+                visits_dos = 0
 
-            logger.info(f"Weekly comparison report generated for {week_start.date()} to {week_end.date()}")
-            return {
-                "company": company_name,
-                "generated_at": datetime.now().isoformat(),
-                "week_start": week_start.strftime('%m/%d/%Y'),
-                "week_end": week_end.strftime('%m/%d/%Y'),
-                "weekly_comparison": {
+                if visit_date_col:
+                    df_dos = df_copy[
+                        (df_copy[visit_date_col].notna()) &
+                        (df_copy[visit_date_col] >= week_start) &
+                        (df_copy[visit_date_col] <= week_end)
+                    ].copy()
+
+                    visits_dos = len(df_dos) if not df_dos.empty else 0
+
+                    # Calculate raw charges (before filters) for debugging
+                    if not df_dos.empty and 'charge' in df_dos.columns:
+                        raw_charges_dos = df_dos[df_dos['charge'] > 0]['charge'].sum()
+                        logger.info(f"  DOS RAW charges (before filters): ${raw_charges_dos:,.2f} from {len(df_dos[df_dos['charge'] > 0])} rows")
+
+                    dos_calc = KPICalculator(df_dos) if not df_dos.empty else None
+                    collections_dos = dos_calc._calculate_filtered_payments() if dos_calc else 0.0
+                    charges_dos = dos_calc._calculate_filtered_charges() if dos_calc else 0.0
+
+                    logger.info(f"  DOS FILTERED metrics: {visits_dos} visits, ${collections_dos:,.2f} collections, ${charges_dos:,.2f} charges")
+                    print(f"  📊 DOS Week {week_start.date()} to {week_end.date()}: Charges=${charges_dos:,.2f}, Visits={visits_dos}")
+
+                # --- Calculate Date Created Metrics (using visit_created_date) ---
+                collections_dc = 0.0
+                charges_dc = 0.0
+                visits_dc = 0
+
+                if visit_created_date_col:
+                    df_dc = df_copy[
+                        (df_copy[visit_created_date_col].notna()) &
+                        (df_copy[visit_created_date_col] >= week_start) &
+                        (df_copy[visit_created_date_col] <= week_end)
+                    ].copy()
+
+                    visits_dc = len(df_dc) if not df_dc.empty else 0
+
+                    # Calculate raw charges (before filters) for debugging
+                    if not df_dc.empty and 'charge' in df_dc.columns:
+                        raw_charges_dc = df_dc[df_dc['charge'] > 0]['charge'].sum()
+                        logger.info(f"  Date Created RAW charges (before filters): ${raw_charges_dc:,.2f} from {len(df_dc[df_dc['charge'] > 0])} rows")
+
+                    dc_calc = KPICalculator(df_dc) if not df_dc.empty else None
+                    collections_dc = dc_calc._calculate_filtered_payments() if dc_calc else 0.0
+                    charges_dc = dc_calc._calculate_filtered_charges() if dc_calc else 0.0
+
+                    logger.info(f"  Date Created FILTERED metrics: {visits_dc} visits, ${collections_dc:,.2f} collections, ${charges_dc:,.2f} charges")
+                    print(f"  📅 Date Created Week {week_start.date()} to {week_end.date()}: Charges=${charges_dc:,.2f}, Visits={visits_dc}")
+
+                # Store this week's data
+                weeks_data.append({
+                    "week_start": week_start.strftime('%m/%d/%Y'),
+                    "week_end": week_end.strftime('%m/%d/%Y'),
+                    "week_label": f"{week_start.strftime('%m/%d')} - {week_end.strftime('%m/%d/%Y')}",
                     "collections_dos": collections_dos,
                     "collections_dc": collections_dc,
                     "charges_dos": charges_dos,
                     "charges_dc": charges_dc,
                     "visits_dos": visits_dos,
                     "visits_dc": visits_dc,
-                }
+                })
+
+            # Reverse the list so oldest week comes first, latest week comes last (ascending order)
+            weeks_data.reverse()
+
+            logger.info(f"Weekly comparison report generated for last 5 weeks (ascending order)")
+            return {
+                "company": company_name,
+                "generated_at": datetime.now().isoformat(),
+                "weeks": weeks_data
             }
 
         except Exception as e:
@@ -1359,42 +1400,50 @@ class KPICalculator:
                 "company": company_name,
                 "generated_at": datetime.now().isoformat(),
                 "error": f"Error generating weekly comparison: {str(e)}",
-                "weekly_comparison": {}
+                "weeks": []
             }
 
     def format_weekly_comparison_as_text(self, report: Dict[str, Any]) -> str:
         """
         Format the weekly comparison report as human-readable text.
-        Shows Collections, Charges, and Visits with both DOS and Date Created columns.
+        Shows Collections, Charges, and Visits with both DOS and Date Created columns for last 5 weeks.
 
         Args:
             report: Report dictionary from generate_weekly_comparison_report()
 
         Returns:
-            Formatted text weekly comparison report
+            Formatted text weekly comparison report with 5 weeks of data
         """
         company = report["company"]
-        week_start = report.get("week_start")
-        week_end = report.get("week_end")
 
         if "error" in report:
             return f"❌ Error: {report['error']}"
 
-        comparison = report.get("weekly_comparison", {})
+        weeks = report.get("weeks", [])
 
-        if not comparison:
+        if not weeks:
             return f"❌ No weekly comparison data available."
 
         # Format output as markdown table with Collections, Charges, Visits each having DOS and Date Created columns
-        output = f"""## SLIDE 7: {company.upper()} - CLIENT SUMMARY - WEEKLY COMPARISON
-
-**Week:** {week_start} - {week_end}
+        output = f"""## SLIDE 7: {company.upper()} - CLIENT SUMMARY - WEEKLY COMPARISON (Last 5 Weeks)
 
 |  | **Collections** |  | **Charges** |  | **Visits** |  |
 |--|-----------------|--|-------------|--|------------|--|
-| **Month/Week** | **DOS** | **Date Created** | **DOS** | **Date Created** | **DOS** | **Date Created** |
-| {week_start} - {week_end} | ${comparison['collections_dos']:,.2f} | ${comparison['collections_dc']:,.2f} | ${comparison['charges_dos']:,.2f} | ${comparison['charges_dc']:,.2f} | {comparison['visits_dos']:,} | {comparison['visits_dc']:,} |
+| **Week** | **DOS** | **Date Created** | **DOS** | **Date Created** | **DOS** | **Date Created** |
 """
+
+        # Add each week's data as a row
+        for week in weeks:
+            week_label = week['week_label']
+            collections_dos = week['collections_dos']
+            collections_dc = week['collections_dc']
+            charges_dos = week['charges_dos']
+            charges_dc = week['charges_dc']
+            visits_dos = week['visits_dos']
+            visits_dc = week['visits_dc']
+
+            output += f"| {week_label} | ${collections_dos:,.2f} | ${collections_dc:,.2f} | ${charges_dos:,.2f} | ${charges_dc:,.2f} | {visits_dos:,} | {visits_dc:,} |\n"
+
         return output.strip()
 
     def generate_monthly_comparison_report(self, company_name: str = "Company") -> Dict[str, Any]:
@@ -1435,29 +1484,42 @@ class KPICalculator:
                 "company": company_name,
                 "generated_at": datetime.now().isoformat(),
                 "error": "No date fields found in data.",
-                "monthly_comparison": {}
+                "months_data": []
             }
 
         try:
-            # Determine reference column for date range (priority: visit_created_date, fallback: visit_date)
-            reference_col = visit_created_date_col if visit_created_date_col else visit_date_col
+            # Convert both date columns to datetime ONCE before the loop
+            if visit_date_col:
+                df_copy[visit_date_col] = pd.to_datetime(df_copy[visit_date_col], errors='coerce')
+            if visit_created_date_col:
+                df_copy[visit_created_date_col] = pd.to_datetime(df_copy[visit_created_date_col], errors='coerce')
 
-            df_copy[reference_col] = pd.to_datetime(df_copy[reference_col], errors='coerce')
-            df_copy = df_copy[df_copy[reference_col].notna()]
-
-            if df_copy.empty:
+            # IMPORTANT: Use visit_date (DOS) to determine month boundaries and day range
+            # Both DOS and Date Created will use the SAME month boundaries (based on DOS)
+            # but filter by their respective date columns
+            if not visit_date_col:
                 return {
                     "company": company_name,
                     "generated_at": datetime.now().isoformat(),
-                    "error": "No valid dates found in data.",
-                    "monthly_comparison": {}
+                    "error": "visit_date column not found - cannot calculate DOS months.",
+                    "months_data": []
                 }
 
-            # Get latest date and calculate day range
-            latest_date = df_copy[reference_col].max()
+            # Get latest visit_date (DOS) and calculate day range
+            latest_date = df_copy[visit_date_col].max()
+
+            if pd.isna(latest_date):
+                return {
+                    "company": company_name,
+                    "generated_at": datetime.now().isoformat(),
+                    "error": "No valid visit_date found in data.",
+                    "months_data": []
+                }
+
             day_of_month = latest_date.day
 
-            logger.info(f"Latest date: {latest_date}, using day range 1-{day_of_month}")
+            logger.info(f"Latest visit_date (DOS): {latest_date}, using day range 1-{day_of_month}")
+            print(f"\n📅 Generating Month-to-Date Report: Latest DOS = {latest_date.date()}, Day Range = 1-{day_of_month}\n")
 
             # Calculate metrics for current month + last 3 months
             months_data = []
@@ -1486,17 +1548,25 @@ class KPICalculator:
                 visits_dos = 0
 
                 if visit_date_col:
-                    df_copy[visit_date_col] = pd.to_datetime(df_copy[visit_date_col], errors='coerce')
                     df_month_dos = df_copy[
                         (df_copy[visit_date_col].notna()) &
                         (df_copy[visit_date_col] >= first_of_target_month) &
                         (df_copy[visit_date_col] <= last_of_range)
-                    ]
+                    ].copy()
+
+                    visits_dos = len(df_month_dos) if not df_month_dos.empty else 0
+
+                    # Calculate raw charges (before filters) for debugging
+                    if not df_month_dos.empty and 'charge' in df_month_dos.columns:
+                        raw_charges_dos = df_month_dos[df_month_dos['charge'] > 0]['charge'].sum()
+                        logger.info(f"  DOS RAW charges (before filters): ${raw_charges_dos:,.2f} from {len(df_month_dos[df_month_dos['charge'] > 0])} rows")
 
                     calc_dos = KPICalculator(df_month_dos) if not df_month_dos.empty else None
                     collections_dos = calc_dos._calculate_filtered_payments() if calc_dos else 0.0
                     charges_dos = calc_dos._calculate_filtered_charges() if calc_dos else 0.0
-                    visits_dos = calc_dos.calculate_total_visits() if calc_dos else 0
+
+                    logger.info(f"  DOS FILTERED metrics: {visits_dos} visits, ${collections_dos:,.2f} collections, ${charges_dos:,.2f} charges")
+                    print(f"  📊 DOS {month_label}: Charges=${charges_dos:,.2f}, Visits={visits_dos}")
 
                 # --- Calculate Date Created Metrics (using visit_created_date) ---
                 collections_dc = 0.0
@@ -1504,17 +1574,25 @@ class KPICalculator:
                 visits_dc = 0
 
                 if visit_created_date_col:
-                    df_copy[visit_created_date_col] = pd.to_datetime(df_copy[visit_created_date_col], errors='coerce')
                     df_month_dc = df_copy[
                         (df_copy[visit_created_date_col].notna()) &
                         (df_copy[visit_created_date_col] >= first_of_target_month) &
                         (df_copy[visit_created_date_col] <= last_of_range)
-                    ]
+                    ].copy()
+
+                    visits_dc = len(df_month_dc) if not df_month_dc.empty else 0
+
+                    # Calculate raw charges (before filters) for debugging
+                    if not df_month_dc.empty and 'charge' in df_month_dc.columns:
+                        raw_charges_dc = df_month_dc[df_month_dc['charge'] > 0]['charge'].sum()
+                        logger.info(f"  Date Created RAW charges (before filters): ${raw_charges_dc:,.2f} from {len(df_month_dc[df_month_dc['charge'] > 0])} rows")
 
                     calc_dc = KPICalculator(df_month_dc) if not df_month_dc.empty else None
                     collections_dc = calc_dc._calculate_filtered_payments() if calc_dc else 0.0
                     charges_dc = calc_dc._calculate_filtered_charges() if calc_dc else 0.0
-                    visits_dc = calc_dc.calculate_total_visits() if calc_dc else 0
+
+                    logger.info(f"  Date Created FILTERED metrics: {visits_dc} visits, ${collections_dc:,.2f} collections, ${charges_dc:,.2f} charges")
+                    print(f"  📅 Date Created {month_label}: Charges=${charges_dc:,.2f}, Visits={visits_dc}")
 
                 months_data.append({
                     "month_label": month_label,
@@ -1526,6 +1604,12 @@ class KPICalculator:
                     "visits_dos": visits_dos,
                     "visits_dc": visits_dc
                 })
+
+            # Reverse the list so oldest month comes first, latest month comes last (ascending order)
+            months_data.reverse()
+
+            logger.info(f"Month-to-date comparison report generated for last 4 months (ascending order)")
+            print(f"\n✅ Month-to-Date Report Complete: {len(months_data)} months generated\n")
 
             return {
                 "company": company_name,
@@ -1565,8 +1649,8 @@ class KPICalculator:
         if not months_data:
             return f"❌ No month-to-date comparison data available."
 
-        # Reverse the order to show oldest to newest (ascending order)
-        months_data_reversed = list(reversed(months_data))
+        # Data is already in ascending order (oldest to newest) from generation function
+        # No need to reverse
 
         # Format output as markdown table with DOS and Date Created columns for each metric
         output = f"""## SLIDE 8: {company.upper()} - CLIENT SUMMARY MONTH TO DATE
@@ -1577,7 +1661,7 @@ class KPICalculator:
 |--|-----------------|--|-------------|--|------------|--|
 | **Month** | **DOS** | **Date Created** | **DOS** | **Date Created** | **DOS** | **Date Created** |"""
 
-        for month in months_data_reversed:
+        for month in months_data:
             month_name = month['month_name']
             output += f"\n| {month_name} | ${month['collections_dos']:,.2f} | ${month['collections_dc']:,.2f} | ${month['charges_dos']:,.2f} | ${month['charges_dc']:,.2f} | {month['visits_dos']:,} | {month['visits_dc']:,} |"
 
@@ -2308,10 +2392,11 @@ class KPICalculator:
             monday = date - timedelta(days=date.weekday())
             return monday
 
+        # Apply week labels to each row (SAME AS ORIGINAL)
         df_filtered['week_label'] = df_filtered[date_col].apply(get_week_label)
         df_filtered['week_sort'] = df_filtered[date_col].apply(get_week_sort_key)
 
-        # Find the last completed week (Monday-Sunday)
+        # Find the last completed week (Monday-Sunday) - SAME AS ORIGINAL
         latest_date = df_filtered[date_col].max()
         # Get days since last Sunday (end of week)
         days_since_sunday = (latest_date.weekday() + 1) % 7
@@ -2322,24 +2407,29 @@ class KPICalculator:
             # Go back to last Sunday
             last_sunday = latest_date - timedelta(days=days_since_sunday)
 
-        last_completed_monday = last_sunday - timedelta(days=6)
-        last_completed_week_label = get_week_label(last_completed_monday)
+        # Calculate last 5 completed weeks - SAME STRATEGY AS ORIGINAL, but 5 times
+        weeks = []
+        week_labels_to_include = []
 
-        # Format the week as date range for display
-        week_date_label = f"{last_completed_monday.strftime('%b %d')} - {last_sunday.strftime('%b %d')}"
+        for week_offset in range(5):  # 0 = most recent week, 4 = 5th week back
+            # Calculate week boundaries (Monday to Sunday)
+            week_end = last_sunday - timedelta(days=7 * week_offset)  # Sunday
+            week_start = week_end - timedelta(days=6)  # Monday
 
-        # Get unique weeks sorted by date
-        week_info = df_filtered.groupby('week_label')['week_sort'].min().reset_index()
-        week_info = week_info.sort_values('week_sort')
+            # Get the week_label for this week's Monday (SAME AS ORIGINAL)
+            week_label_key = get_week_label(week_start)
+            week_labels_to_include.append(week_label_key)
 
-        # Get only the last completed week (Monday-Sunday)
-        if len(week_info) > 0:
-            # Use date range for display
-            weeks = [week_date_label]
-            # Filter data to only the last completed week
-            df_filtered = df_filtered[df_filtered['week_label'] == last_completed_week_label]
-        else:
-            weeks = []
+            # Format the week as date range for display (SAME AS ORIGINAL)
+            week_date_label = f"{week_start.strftime('%b %d')} - {week_end.strftime('%b %d')}"
+            weeks.append(week_date_label)
+
+        # Reverse so oldest week is first (leftmost), latest week is last (rightmost)
+        weeks.reverse()
+        week_labels_to_include.reverse()
+
+        # Filter data to only the last 5 completed weeks (SAME AS ORIGINAL - just 5 instead of 1)
+        df_filtered = df_filtered[df_filtered['week_label'].isin(week_labels_to_include)]
 
         # Use fixed list of statuses in specific order (excluding Claim Created)
         statuses = [
@@ -2354,30 +2444,43 @@ class KPICalculator:
             'Client Requested Hold'
         ]
 
-        # Build data matrix
+        # Build data matrix - SAME AS ORIGINAL LOGIC
         data = {}
-        totals = {}
 
-        # Create lowercase version of status column for matching
+        # Create lowercase version of status column for matching (SAME AS ORIGINAL)
         df_filtered['status_lower'] = df_filtered[status_col].str.lower()
 
+        # Loop through each status (SAME AS ORIGINAL)
         for status in statuses:
             data[status] = {}
-            # Count all rows for this status in the filtered data (already filtered to last week)
-            count = len(df_filtered[df_filtered['status_lower'] == status.lower()])
-            data[status][week_date_label] = count
-            totals[status] = count
 
-        # Calculate grand total for the week
+            # Loop through each week
+            for idx in range(len(week_labels_to_include)):
+                week_label_key = week_labels_to_include[idx]
+                week_display = weeks[idx]
+
+                # Filter to this specific week from the already-filtered df (SAME AS ORIGINAL)
+                df_week = df_filtered[df_filtered['week_label'] == week_label_key]
+
+                # Count all rows for this status in this week (SAME AS ORIGINAL)
+                count = len(df_week[df_week['status_lower'] == status.lower()])
+                data[status][week_display] = count
+
+        # Calculate grand total for each week (SAME AS ORIGINAL)
         week_totals = {}
-        week_totals[week_date_label] = len(df_filtered)
+        for idx in range(len(week_labels_to_include)):
+            week_label_key = week_labels_to_include[idx]
+            week_display = weeks[idx]
+
+            # Filter to this specific week
+            df_week = df_filtered[df_filtered['week_label'] == week_label_key]
+            week_totals[week_display] = len(df_week)
 
         return {
             "company": company_name,
             "weeks": weeks,
             "statuses": statuses,
             "data": data,
-            "totals": totals,
             "week_totals": week_totals,
             "grand_total": len(df_filtered),
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -2397,9 +2500,7 @@ class KPICalculator:
         weeks = report.get("weeks", [])
         statuses = report.get("statuses", [])
         data = report.get("data", {})
-        totals = report.get("totals", {})
         week_totals = report.get("week_totals", {})
-        grand_total = report.get("grand_total", 0)
 
         if report.get("error"):
             return f"❌ Error generating unbilled status report: {report['error']}"
@@ -2407,15 +2508,13 @@ class KPICalculator:
         if not weeks or not statuses:
             return "❌ No unbilled status data available."
 
-        # Build output as markdown table
+        # Build output as markdown table (NO Grand Total column)
         # Header
         header = "| Visit Status |"
         separator = "|--------------|"
         for week in weeks:
             header += f" {week} |"
             separator += "------|"
-        header += " Grand Total |"
-        separator += "-------------|"
 
         output = f"""## SLIDE 9: {company.upper()} - UNBILLED STATUS
 
@@ -2423,20 +2522,18 @@ class KPICalculator:
 {separator}
 """
 
-        # Data rows
+        # Data rows (NO Grand Total column)
         for status in statuses:
             row = f"| {status} |"
             for week in weeks:
                 count = data.get(status, {}).get(week, 0)
                 row += f" {count} |"
-            row += f" {totals.get(status, 0)} |"
             output += row + "\n"
 
-        # Total row
+        # Total row (NO Grand Total column)
         total_row = "| **Total** |"
         for week in weeks:
             total_row += f" **{week_totals.get(week, 0)}** |"
-        total_row += f" **{grand_total}** |"
         output += total_row + "\n"
 
         return output.strip()
