@@ -2109,7 +2109,7 @@ class KPICalculator:
 
     def format_quarterly_report_as_text(self, report: Dict[str, Any]) -> str:
         """
-        Format the quarterly report as human-readable text.
+        Format the quarterly report as human-readable text showing 9 quarters (2024 Q1 to 2026 Q1).
 
         Args:
             report: Report dictionary from generate_quarterly_report()
@@ -2127,31 +2127,70 @@ class KPICalculator:
         if not quarters:
             return "❌ No quarterly data available."
 
-        # Find the latest quarter (most recent year + quarter)
-        latest_quarter_key = max(quarters.keys(), key=lambda k: (quarters[k]["year"], quarters[k]["quarter"]))
-        latest_quarter_data = quarters[latest_quarter_key]
+        # Define the 9 quarters we want to show (2024 Q1 to 2026 Q1)
+        target_quarters = [
+            (2024, 1), (2024, 2), (2024, 3), (2024, 4),
+            (2025, 1), (2025, 2), (2025, 3), (2025, 4),
+            (2026, 1)
+        ]
 
-        year = latest_quarter_data["year"]
-        quarter = latest_quarter_data["quarter"]
-        kpis = latest_quarter_data["kpis"]
+        # Filter quarters data to only include target quarters
+        # Sort in ascending order (oldest first, latest last)
+        available_quarters = []
+        for year, quarter in target_quarters:
+            quarter_key = f"{year}_Q{quarter}"
+            if quarter_key in quarters:
+                available_quarters.append({
+                    "key": quarter_key,
+                    "year": year,
+                    "quarter": quarter,
+                    "data": quarters[quarter_key]
+                })
 
-        # Format output - show only latest quarter
-        output = f"""## SLIDE 4: {company.upper()} - KPI METRICS QUARTERLY (Q{quarter} {year})
+        if not available_quarters:
+            return f"❌ No quarterly data available for the period 2024 Q1 to 2026 Q1."
 
-| Type | Value |
-|------|-------|
-| Visits | {kpis.get('visits', 0):,} |
-| Charges | ${kpis.get('charges', 0):,.2f} |
-| Charges Submitted (%) | {kpis.get('charges_submitted_pct', 0):.2f}% |
-| Payments | ${kpis.get('payments', 0):,.2f} |
-| Gross Collection Rate (%) | {kpis.get('gross_collection_rate_pct', 0):.2f}% |
-| Net Collection Rate (%) | {kpis.get('net_collection_rate_pct', 0):.2f}% |
-| Days in AR (DAR) | {kpis.get('days_in_ar', 0)} Days |
-| Billed AR | ${kpis.get('billed_ar', 0):,.2f} |
-| Billed AR % | {kpis.get('billed_ar_pct', 0):.2f}% |
-| Unbilled AR | ${kpis.get('unbilled_ar', 0):,.2f} |
-| Unbilled AR (%) | {kpis.get('unbilled_ar_pct', 0):.2f}% |
-| Denial vs Resolution (%) | {kpis.get('denial_resolution_rate_pct', 0):.2f}% |
+        logger.info(f"Slide 4: Showing {len(available_quarters)} quarters from 2024 Q1 to 2026 Q1")
+        print(f"  📊 Slide 4: Showing {len(available_quarters)} quarters (2024 Q1 to 2026 Q1)")
+
+        # Build the header row with quarter labels
+        header = "| Metric |"
+        separator = "|--------|"
+        for q in available_quarters:
+            header += f" Q{q['quarter']} {q['year']} |"
+            separator += "----------|"
+
+        # Build rows for each KPI metric
+        metrics = [
+            ("Visits", "visits", lambda x: f"{x:,}"),
+            ("Charges", "charges", lambda x: f"${x:,.2f}"),
+            ("Charges Submitted (%)", "charges_submitted_pct", lambda x: f"{x:.2f}%"),
+            ("Payments", "payments", lambda x: f"${x:,.2f}"),
+            ("Gross Collection Rate (%)", "gross_collection_rate_pct", lambda x: f"{x:.2f}%"),
+            ("Net Collection Rate (%)", "net_collection_rate_pct", lambda x: f"{x:.2f}%"),
+            ("Days in AR (DAR)", "days_in_ar", lambda x: f"{x} Days"),
+            ("Billed AR", "billed_ar", lambda x: f"${x:,.2f}"),
+            ("Billed AR %", "billed_ar_pct", lambda x: f"{x:.2f}%"),
+            ("Unbilled AR", "unbilled_ar", lambda x: f"${x:,.2f}"),
+            ("Unbilled AR (%)", "unbilled_ar_pct", lambda x: f"{x:.2f}%"),
+            ("Denial vs Resolution (%)", "denial_resolution_rate_pct", lambda x: f"{x:.2f}%"),
+        ]
+
+        rows = []
+        for metric_name, metric_key, formatter in metrics:
+            row = f"| {metric_name} |"
+            for q in available_quarters:
+                kpis = q['data'].get('kpis', {})
+                value = kpis.get(metric_key, 0)
+                row += f" {formatter(value)} |"
+            rows.append(row)
+
+        # Format output
+        output = f"""## SLIDE 4: {company.upper()} - KPI METRICS QUARTERLY (2024 Q1 to 2026 Q1)
+
+{header}
+{separator}
+{chr(10).join(rows)}
 """
         return output.strip()
 
@@ -2617,8 +2656,22 @@ class KPICalculator:
         df_denied[desc_col] = df_denied[desc_col].str.strip().str.replace(r'\s+', ' ', regex=True)
 
         # Extract denial code (part before the colon, e.g., "CO-16" from "CO-16: Description...")
+        # Handle comma-separated codes (e.g., "CO-97, CO-22") by taking only the first code
         # Create a new column for the denial code
-        df_denied['denial_code'] = df_denied[desc_col].str.split(':').str[0].str.strip()
+        df_denied['denial_code'] = df_denied[desc_col].str.split(':').str[0].str.split(',').str[0].str.strip()
+
+        # Log when multiple codes are found in a single description
+        multi_code_descriptions = df_denied[df_denied[desc_col].str.contains(',', na=False) &
+                                            df_denied[desc_col].str.split(':').str[0].str.contains(',', na=False)]
+        if not multi_code_descriptions.empty:
+            logger.info(f"Found {len(multi_code_descriptions)} denial descriptions with multiple comma-separated codes")
+            print(f"  📋 Slide 11: Found {len(multi_code_descriptions)} descriptions with multiple codes (taking first code only)")
+            # Show a few examples for debugging
+            for idx, row in multi_code_descriptions.head(3).iterrows():
+                original_codes = row[desc_col].split(':')[0] if ':' in row[desc_col] else row[desc_col]
+                selected_code = row['denial_code']
+                logger.info(f"    Example: '{original_codes}' → Using '{selected_code}'")
+                print(f"    Example: '{original_codes}' → Using '{selected_code}'")
 
         # Keep the full description for reference but group by code
         df_denied['full_description'] = df_denied[desc_col]
